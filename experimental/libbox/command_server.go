@@ -50,6 +50,9 @@ func NewCommandServer(handler CommandServerHandler, platformInterface PlatformIn
 		useProcFS: platformInterface.UseProcFS(),
 	}
 	service.MustRegister[adapter.PlatformInterface](ctx, platformWrapper)
+	// Expose wrapper to the xray bridge so it can protect its outbound sockets
+	// via AutoDetectInterfaceControl (Android's VpnService.protect).
+	setXrayPlatformWrapper(platformWrapper)
 	server := &CommandServer{
 		handler:           handler,
 		platformInterface: platformInterface,
