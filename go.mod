@@ -71,11 +71,14 @@ require (
 
 require (
 	filippo.io/edwards25519 v1.1.0 // indirect
+	github.com/MakeNowJust/heredoc/v2 v2.0.1 // indirect
 	github.com/ajg/form v1.5.1 // indirect
 	github.com/akutz/memconn v0.1.0 // indirect
 	github.com/alexbrainman/sspi v0.0.0-20231016080023-1a75b4708caa // indirect
+	github.com/amnezia-vpn/amneziawg-go v0.2.16 // indirect
 	github.com/andybalholm/brotli v1.1.1 // indirect
 	github.com/apernet/quic-go v0.59.1-0.20260217092621-db4786c77a22 // indirect
+	github.com/artem-russkikh/wireproxy-awg v1.0.13 // indirect
 	github.com/cenkalti/backoff/v4 v4.3.0 // indirect
 	github.com/cloudflare/circl v1.6.3 // indirect
 	github.com/coreos/go-iptables v0.7.1-0.20240112124308-65c67c9f46e6 // indirect
@@ -90,6 +93,7 @@ require (
 	github.com/fxamacker/cbor/v2 v2.7.0 // indirect
 	github.com/gaissmai/bart v0.18.0 // indirect
 	github.com/ghodss/yaml v1.0.1-0.20220118164431-d8423dcdf344 // indirect
+	github.com/go-ini/ini v1.67.0 // indirect
 	github.com/go-jose/go-jose/v4 v4.1.3 // indirect
 	github.com/go-json-experiment/json v0.0.0-20250813024750-ebf49471dced // indirect
 	github.com/go-ole/go-ole v1.3.0 // indirect
@@ -159,6 +163,7 @@ require (
 	github.com/tailscale/netlink v1.1.1-0.20240822203006-4d49adab4de7 // indirect
 	github.com/tailscale/peercred v0.0.0-20250107143737-35a0c7bd7edc // indirect
 	github.com/tailscale/web-client-prebuilt v0.0.0-20250124233751-d4cd19a26976 // indirect
+	github.com/things-go/go-socks5 v0.0.5 // indirect
 	github.com/tidwall/gjson v1.18.0 // indirect
 	github.com/tidwall/match v1.1.1 // indirect
 	github.com/tidwall/pretty v1.2.1 // indirect
