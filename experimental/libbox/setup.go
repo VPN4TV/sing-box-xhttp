@@ -1,6 +1,7 @@
 package libbox
 
 import (
+	"fmt"
 	"math"
 	"os"
 	"path/filepath"
@@ -95,11 +96,23 @@ func ReloadSetupOptions(options *SetupOptions) {
 	}
 }
 
-func Setup(options *SetupOptions) error {
+func Setup(options *SetupOptions) (retErr error) {
+	defer func() {
+		if r := recover(); r != nil {
+			retErr = E.New("panic in Setup: ", fmt.Sprint(r))
+		}
+	}()
 	applySetupOptions(options)
-	os.MkdirAll(sWorkingPath, 0o777)
-	os.MkdirAll(sTempPath, 0o777)
-	return redirectStderr(filepath.Join(sWorkingPath, "CrashReport-"+sCrashReportSource+".log"))
+	if err := os.MkdirAll(sWorkingPath, 0o777); err != nil {
+		return E.Cause(err, "create working dir ", sWorkingPath)
+	}
+	if err := os.MkdirAll(sTempPath, 0o777); err != nil {
+		return E.Cause(err, "create temp dir ", sTempPath)
+	}
+	if err := redirectStderr(filepath.Join(sWorkingPath, "CrashReport-"+sCrashReportSource+".log")); err != nil {
+		return E.Cause(err, "redirect stderr")
+	}
+	return nil
 }
 
 func SetLocale(localeId string) error {
