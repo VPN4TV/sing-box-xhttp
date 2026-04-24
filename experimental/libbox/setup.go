@@ -55,6 +55,12 @@ type SetupOptions struct {
 	OomKillerEnabled        bool
 	OomKillerDisabled       bool
 	OomMemoryLimit          int64
+	// CrashLogPath is the file the Go runtime writes a crash report to when
+	// the process is about to abort (debug.SetCrashOutput). Includes all
+	// goroutine stacks, which the native unwinder can't recover from a
+	// SIGABRT inside _cgo_topofstack. The Kotlin side reads this file on
+	// next launch to surface the real cause via Play Vitals.
+	CrashLogPath string
 }
 
 func applySetupOptions(options *SetupOptions) {
@@ -117,6 +123,20 @@ func Setup(options *SetupOptions) (retErr error) {
 	}
 	if err := redirectStderr(filepath.Join(sWorkingPath, "CrashReport-"+sCrashReportSource+".log")); err != nil {
 		fmt.Fprintf(os.Stderr, "libbox setup: stderr redirect non-fatal: %v\n", err)
+	}
+	if options.CrashLogPath != "" {
+		// Best-effort: open file for writing, hand it to the runtime. If
+		// open fails we silently skip; the runtime keeps the fd open for
+		// the lifetime of the process and writes a full goroutine dump
+		// when it aborts.
+		if f, err := os.OpenFile(options.CrashLogPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o644); err == nil {
+			if err := debug.SetCrashOutput(f, debug.CrashOptions{}); err != nil {
+				fmt.Fprintf(os.Stderr, "libbox setup: SetCrashOutput non-fatal: %v\n", err)
+				f.Close()
+			}
+		} else {
+			fmt.Fprintf(os.Stderr, "libbox setup: open crash log non-fatal: %v\n", err)
+		}
 	}
 	return nil
 }
