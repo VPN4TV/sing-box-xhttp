@@ -103,14 +103,21 @@ func Setup(options *SetupOptions) (retErr error) {
 		}
 	}()
 	applySetupOptions(options)
+	// Multi-user Android TVs (Sony Bravia, Hisense, Haier MatrixTV) install
+	// the app under user 0 but the runtime process executes as user 10. Path
+	// /data/user/0/<pkg>/cache and /storage/emulated/0/Android/data/<pkg>/...
+	// are owned by user 0 and the runtime user gets EACCES. Don't fail Setup
+	// over storage permission errors — the in-memory libbox is still usable
+	// (no crash log capture, but VPN works). The Kotlin side already mkdirs
+	// these paths up front, so a benign EEXIST is also OK.
 	if err := os.MkdirAll(sWorkingPath, 0o777); err != nil {
-		return E.Cause(err, "create working dir ", sWorkingPath)
+		fmt.Fprintf(os.Stderr, "libbox setup: working dir mkdir non-fatal: %v\n", err)
 	}
 	if err := os.MkdirAll(sTempPath, 0o777); err != nil {
-		return E.Cause(err, "create temp dir ", sTempPath)
+		fmt.Fprintf(os.Stderr, "libbox setup: temp dir mkdir non-fatal: %v\n", err)
 	}
 	if err := redirectStderr(filepath.Join(sWorkingPath, "CrashReport-"+sCrashReportSource+".log")); err != nil {
-		return E.Cause(err, "redirect stderr")
+		fmt.Fprintf(os.Stderr, "libbox setup: stderr redirect non-fatal: %v\n", err)
 	}
 	return nil
 }
