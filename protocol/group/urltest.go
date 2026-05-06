@@ -97,10 +97,10 @@ func (s *URLTest) Close() error {
 }
 
 func (s *URLTest) Now() string {
-	if s.group.selectedOutboundTCP != nil {
-		return s.group.selectedOutboundTCP.Tag()
-	} else if s.group.selectedOutboundUDP != nil {
-		return s.group.selectedOutboundUDP.Tag()
+	if tcp := s.group.loadSelectedTCP(); tcp != nil {
+		return tcp.Tag()
+	} else if udp := s.group.loadSelectedUDP(); udp != nil {
+		return udp.Tag()
 	}
 	return ""
 }
@@ -122,9 +122,9 @@ func (s *URLTest) DialContext(ctx context.Context, network string, destination M
 	var outbound adapter.Outbound
 	switch N.NetworkName(network) {
 	case N.NetworkTCP:
-		outbound = s.group.selectedOutboundTCP
+		outbound = s.group.loadSelectedTCP()
 	case N.NetworkUDP:
-		outbound = s.group.selectedOutboundUDP
+		outbound = s.group.loadSelectedUDP()
 	default:
 		return nil, E.Extend(N.ErrUnknownNetwork, network)
 	}
@@ -145,7 +145,7 @@ func (s *URLTest) DialContext(ctx context.Context, network string, destination M
 
 func (s *URLTest) ListenPacket(ctx context.Context, destination M.Socksaddr) (net.PacketConn, error) {
 	s.group.Touch()
-	outbound := s.group.selectedOutboundUDP
+	outbound := s.group.loadSelectedUDP()
 	if outbound == nil {
 		outbound, _ = s.group.Select(N.NetworkUDP)
 	}
@@ -173,7 +173,7 @@ func (s *URLTest) NewPacketConnectionEx(ctx context.Context, conn N.PacketConn, 
 
 func (s *URLTest) NewDirectRouteConnection(metadata adapter.InboundContext, routeContext tun.DirectRouteContext, timeout time.Duration) (tun.DirectRouteDestination, error) {
 	s.group.Touch()
-	selected := s.group.selectedOutboundTCP
+	selected := s.group.loadSelectedTCP()
 	if selected == nil {
 		selected, _ = s.group.Select(N.NetworkTCP)
 	}
@@ -200,8 +200,16 @@ type URLTestGroup struct {
 	idleTimeout                  time.Duration
 	history                      adapter.URLTestHistoryStorage
 	checking                     atomic.Bool
-	selectedOutboundTCP          adapter.Outbound
-	selectedOutboundUDP          adapter.Outbound
+	// selectedTCPRef/UDPRef hold the currently picked outbound. Direct
+	// `adapter.Outbound` interface fields used to be read concurrently
+	// from gomobile-thread (URLTest.Now via SubscribeGroups) and written
+	// from the periodic ticker goroutine (performUpdateCheck). On 32-bit
+	// ARM an interface is two 4-byte words, so a torn read produced
+	// "bad pointer in Go heap" runtime.throw clusters across vc50318+
+	// (cgocheck=1 in vc50322 confirmed urltest.go:101 as the call site).
+	// atomic.Pointer makes the swap a single word operation.
+	selectedTCPRef               atomic.Pointer[outboundRef]
+	selectedUDPRef               atomic.Pointer[outboundRef]
 	interruptGroup               *interrupt.Group
 	interruptExternalConnections bool
 	access                       sync.Mutex
@@ -289,16 +297,16 @@ func (g *URLTestGroup) Select(network string) (adapter.Outbound, bool) {
 	var minOutbound adapter.Outbound
 	switch network {
 	case N.NetworkTCP:
-		if g.selectedOutboundTCP != nil {
-			if history := g.history.LoadURLTestHistory(RealTag(g.selectedOutboundTCP)); history != nil {
-				minOutbound = g.selectedOutboundTCP
+		if cur := g.loadSelectedTCP(); cur != nil {
+			if history := g.history.LoadURLTestHistory(RealTag(cur)); history != nil {
+				minOutbound = cur
 				minDelay = history.Delay
 			}
 		}
 	case N.NetworkUDP:
-		if g.selectedOutboundUDP != nil {
-			if history := g.history.LoadURLTestHistory(RealTag(g.selectedOutboundUDP)); history != nil {
-				minOutbound = g.selectedOutboundUDP
+		if cur := g.loadSelectedUDP(); cur != nil {
+			if history := g.history.LoadURLTestHistory(RealTag(cur)); history != nil {
+				minOutbound = cur
 				minDelay = history.Delay
 			}
 		}
@@ -411,19 +419,57 @@ func (g *URLTestGroup) urlTest(ctx context.Context, force bool) (map[string]uint
 
 func (g *URLTestGroup) performUpdateCheck() {
 	var updated bool
-	if outbound, exists := g.Select(N.NetworkTCP); outbound != nil && (g.selectedOutboundTCP == nil || (exists && outbound != g.selectedOutboundTCP)) {
-		if g.selectedOutboundTCP != nil {
+	curTCP := g.loadSelectedTCP()
+	if outbound, exists := g.Select(N.NetworkTCP); outbound != nil && (curTCP == nil || (exists && outbound != curTCP)) {
+		if curTCP != nil {
 			updated = true
 		}
-		g.selectedOutboundTCP = outbound
+		g.storeSelectedTCP(outbound)
 	}
-	if outbound, exists := g.Select(N.NetworkUDP); outbound != nil && (g.selectedOutboundUDP == nil || (exists && outbound != g.selectedOutboundUDP)) {
-		if g.selectedOutboundUDP != nil {
+	curUDP := g.loadSelectedUDP()
+	if outbound, exists := g.Select(N.NetworkUDP); outbound != nil && (curUDP == nil || (exists && outbound != curUDP)) {
+		if curUDP != nil {
 			updated = true
 		}
-		g.selectedOutboundUDP = outbound
+		g.storeSelectedUDP(outbound)
 	}
 	if updated {
 		g.interruptGroup.Interrupt(g.interruptExternalConnections)
+	}
+}
+
+// outboundRef wraps adapter.Outbound for atomic.Pointer storage.
+// Single-word atomic swap of *outboundRef is race-free even on 32-bit
+// ARM, where the underlying interface (2 words) cannot be swapped
+// atomically without this indirection.
+type outboundRef struct{ value adapter.Outbound }
+
+func (g *URLTestGroup) loadSelectedTCP() adapter.Outbound {
+	if r := g.selectedTCPRef.Load(); r != nil {
+		return r.value
+	}
+	return nil
+}
+
+func (g *URLTestGroup) loadSelectedUDP() adapter.Outbound {
+	if r := g.selectedUDPRef.Load(); r != nil {
+		return r.value
+	}
+	return nil
+}
+
+func (g *URLTestGroup) storeSelectedTCP(o adapter.Outbound) {
+	if o == nil {
+		g.selectedTCPRef.Store(nil)
+	} else {
+		g.selectedTCPRef.Store(&outboundRef{value: o})
+	}
+}
+
+func (g *URLTestGroup) storeSelectedUDP(o adapter.Outbound) {
+	if o == nil {
+		g.selectedUDPRef.Store(nil)
+	} else {
+		g.selectedUDPRef.Store(&outboundRef{value: o})
 	}
 }
