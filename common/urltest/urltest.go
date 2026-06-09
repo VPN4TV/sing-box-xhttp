@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/url"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/sagernet/sing-box/adapter"
@@ -22,7 +23,14 @@ var _ adapter.URLTestHistoryStorage = (*HistoryStorage)(nil)
 type HistoryStorage struct {
 	access       sync.RWMutex
 	delayHistory map[string]*adapter.URLTestHistory
-	updateHook   *observable.Subscriber[struct{}]
+	// updateHook is the subscriber forwarding URLTest history updates to the
+	// gRPC layer (urlTestObserver in daemon/started_service.go). SetHook ran
+	// without a lock, so it raced with notifyUpdated (called under access.Lock
+	// from Store/Delete). On 32-bit ARM the pointer write itself is aligned
+	// and atomic, so we never saw a torn pointer — but the consumer could
+	// still pick up a stale subscriber after Close set it to nil. Atomic
+	// swap makes the publish/clear race-free.
+	updateHook atomic.Pointer[observable.Subscriber[struct{}]]
 }
 
 func NewHistoryStorage() *HistoryStorage {
@@ -32,7 +40,7 @@ func NewHistoryStorage() *HistoryStorage {
 }
 
 func (s *HistoryStorage) SetHook(hook *observable.Subscriber[struct{}]) {
-	s.updateHook = hook
+	s.updateHook.Store(hook)
 }
 
 func (s *HistoryStorage) LoadURLTestHistory(tag string) *adapter.URLTestHistory {
@@ -59,7 +67,7 @@ func (s *HistoryStorage) StoreURLTestHistory(tag string, history *adapter.URLTes
 }
 
 func (s *HistoryStorage) notifyUpdated() {
-	updateHook := s.updateHook
+	updateHook := s.updateHook.Load()
 	if updateHook != nil {
 		updateHook.Emit(struct{}{})
 	}
@@ -68,7 +76,7 @@ func (s *HistoryStorage) notifyUpdated() {
 func (s *HistoryStorage) Close() error {
 	s.access.Lock()
 	defer s.access.Unlock()
-	s.updateHook = nil
+	s.updateHook.Store(nil)
 	return nil
 }
 
