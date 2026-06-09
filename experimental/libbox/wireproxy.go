@@ -268,10 +268,11 @@ func wireproxyLog(format string, args ...any) {
 
 // WireproxyLog returns up to the last wireproxyLogMax log lines emitted by
 // the AWG bridge, separated by newlines. Exposed via gomobile for diagnostics.
-func WireproxyLog() string {
+// Wrapped — same 32-bit ARM unaligned-string-return reason as OutlineLog.
+func WireproxyLog() *StringBox {
 	wireproxyLogMu.Lock()
 	defer wireproxyLogMu.Unlock()
-	return strings.Join(wireproxyLogLines, "\n")
+	return wrapString(strings.Join(wireproxyLogLines, "\n"))
 }
 
 // Reference io to make sure it stays imported across refactors.

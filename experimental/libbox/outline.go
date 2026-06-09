@@ -64,10 +64,15 @@ func outlineLog(format string, args ...any) {
 
 // OutlineLog returns up to the last [outlineLogMax] log lines emitted by the
 // outline bridge, separated by newlines. Exposed via gomobile for diagnostics.
-func OutlineLog() string {
+// Wrapped in StringBox: gomobile-exported `string` return on 32-bit ARM
+// triggers `bulkBarrierPreWrite: unaligned arguments` (golang/go#46893)
+// because the two-word string header lands on a 4-byte aligned stack slot;
+// the write barrier then corrupts the heap and GC blames a bad pointer
+// later. Heap-allocating the wrapper struct sidesteps the issue.
+func OutlineLog() *StringBox {
 	outlineLogMu.Lock()
 	defer outlineLogMu.Unlock()
-	return strings.Join(outlineLogLines, "\n")
+	return wrapString(strings.Join(outlineLogLines, "\n"))
 }
 
 // newOutlineProviders builds a fresh ProviderContainer whose root TCP dialer
