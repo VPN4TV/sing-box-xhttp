@@ -38,7 +38,7 @@ func baseReportMetadata() reportMetadata {
 		ProcessName: processName,
 		ProcessPath: processPath,
 		CoreVersion: C.Version,
-		GoVersion:   GoVersion(),
+		GoVersion:   GoVersion().Value,
 	}
 }
 

@@ -74,8 +74,9 @@ func (s *HistoryStorage) notifyUpdated() {
 }
 
 func (s *HistoryStorage) Close() error {
-	s.access.Lock()
-	defer s.access.Unlock()
+	// No access lock needed — updateHook is atomic and no other field is
+	// touched. Keeping the lock would have been inconsistent with SetHook,
+	// which is deliberately lock-free for the same publish/clear path.
 	s.updateHook.Store(nil)
 	return nil
 }

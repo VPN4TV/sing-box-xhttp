@@ -37,26 +37,31 @@ type RoutePrefix struct {
 	prefix  int
 }
 
-func (p *RoutePrefix) Address() string {
-	return p.address.String()
+// RoutePrefix's three string-returning methods are all wrapped in *StringBox —
+// see setup.go for the golang/go#46893 rationale. These get called from the
+// Kotlin VPNService for every IPv4/IPv6 address, route, and exclude on every
+// session start, so on 32-bit ARM TVs they are one of the highest-frequency
+// gomobile string returns we expose. Upstream cec7e470 missed this hot path.
+func (p *RoutePrefix) Address() *StringBox {
+	return wrapString(p.address.String())
 }
 
 func (p *RoutePrefix) Prefix() int32 {
 	return int32(p.prefix)
 }
 
-func (p *RoutePrefix) Mask() string {
+func (p *RoutePrefix) Mask() *StringBox {
 	var bits int
 	if p.address.Is6() {
 		bits = 128
 	} else {
 		bits = 32
 	}
-	return net.IP(net.CIDRMask(p.prefix, bits)).String()
+	return wrapString(net.IP(net.CIDRMask(p.prefix, bits)).String())
 }
 
-func (p *RoutePrefix) String() string {
-	return netip.PrefixFrom(p.address, p.prefix).String()
+func (p *RoutePrefix) String() *StringBox {
+	return wrapString(netip.PrefixFrom(p.address, p.prefix).String())
 }
 
 type RoutePrefixIterator interface {

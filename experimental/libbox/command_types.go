@@ -279,16 +279,16 @@ func (c *Connection) Chain() StringIterator {
 	return newIterator(c.chainList)
 }
 
-func (c *Connection) DisplayDestination() string {
+func (c *Connection) DisplayDestination() *StringBox {
 	destination := M.ParseSocksaddr(c.Destination)
 	if destination.IsIP() && c.Domain != "" {
 		destination = M.Socksaddr{
 			Fqdn: c.Domain,
 			Port: destination.Port,
 		}
-		return destination.String()
+		return wrapString(destination.String())
 	}
-	return c.Destination
+	return wrapString(c.Destination)
 }
 
 type ConnectionIterator interface {
