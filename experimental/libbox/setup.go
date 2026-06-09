@@ -104,7 +104,12 @@ func ReloadSetupOptions(options *SetupOptions) {
 func Setup(options *SetupOptions) (retErr error) {
 	defer func() {
 		if r := recover(); r != nil {
-			retErr = E.New("panic in Setup: ", fmt.Sprint(r))
+			// Capture the Go stack — fmt.Sprint(r) alone gives only the
+			// panic value (e.g. "runtime error: index out of range"),
+			// which is useless for diagnostics on 32-bit TVs. The Kotlin
+			// side's StackTraceElement injection then surfaces it in
+			// Vitals frames verbatim.
+			retErr = E.New("panic in Setup: ", fmt.Sprint(r), "\n", string(debug.Stack()))
 		}
 	}()
 	applySetupOptions(options)

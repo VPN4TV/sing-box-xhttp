@@ -4,14 +4,14 @@ import (
 	"net/url"
 )
 
-func GenerateRemoteProfileImportLink(name string, remoteURL string) string {
+func GenerateRemoteProfileImportLink(name string, remoteURL string) *StringBox {
 	importLink := &url.URL{
 		Scheme:   "sing-box",
 		Host:     "import-remote-profile",
 		RawQuery: url.Values{"url": []string{remoteURL}}.Encode(),
 		Fragment: name,
 	}
-	return importLink.String()
+	return wrapString(importLink.String())
 }
 
 type ImportRemoteProfile struct {
