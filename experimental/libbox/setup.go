@@ -152,28 +152,35 @@ func SetLocale(localeId string) error {
 	return nil
 }
 
-func Version() string {
-	return C.Version
+// String-returning helpers are all wrapped in *StringBox to dodge the
+// bulkBarrierPreWrite-unaligned-arguments panic on 32-bit ARM
+// (golang/go#46893). FormatBytes in particular gets polled once a
+// second from the foreground-service notification updater; a raw
+// `string` return there meant every active session on a 32-bit TV did
+// the unaligned write once a second, gradually corrupting the heap
+// until GC tripped over it.
+func Version() *StringBox {
+	return wrapString(C.Version)
 }
 
-func GoVersion() string {
-	return runtime.Version() + ", " + runtime.GOOS + "/" + runtime.GOARCH
+func GoVersion() *StringBox {
+	return wrapString(runtime.Version() + ", " + runtime.GOOS + "/" + runtime.GOARCH)
 }
 
-func FormatBytes(length int64) string {
-	return byteformats.FormatKBytes(uint64(length))
+func FormatBytes(length int64) *StringBox {
+	return wrapString(byteformats.FormatKBytes(uint64(length)))
 }
 
-func FormatMemoryBytes(length int64) string {
-	return byteformats.FormatMemoryKBytes(uint64(length))
+func FormatMemoryBytes(length int64) *StringBox {
+	return wrapString(byteformats.FormatMemoryKBytes(uint64(length)))
 }
 
-func FormatDuration(duration int64) string {
-	return log.FormatDuration(time.Duration(duration) * time.Millisecond)
+func FormatDuration(duration int64) *StringBox {
+	return wrapString(log.FormatDuration(time.Duration(duration) * time.Millisecond))
 }
 
-func FormatBitrate(bps int64) string {
-	return networkquality.FormatBitrate(bps)
+func FormatBitrate(bps int64) *StringBox {
+	return wrapString(networkquality.FormatBitrate(bps))
 }
 
 const NetworkQualityDefaultConfigURL = networkquality.DefaultConfigURL
@@ -214,18 +221,18 @@ const (
 	NATFilteringAddressAndPortDependent = int32(stun.NATFilteringAddressAndPortDependent)
 )
 
-func FormatNATMapping(value int32) string {
-	return stun.NATMapping(value).String()
+func FormatNATMapping(value int32) *StringBox {
+	return wrapString(stun.NATMapping(value).String())
 }
 
-func FormatNATFiltering(value int32) string {
-	return stun.NATFiltering(value).String()
+func FormatNATFiltering(value int32) *StringBox {
+	return wrapString(stun.NATFiltering(value).String())
 }
 
-func FormatFQDN(fqdn string) string {
-	return dns.FqdnToDomain(fqdn)
+func FormatFQDN(fqdn string) *StringBox {
+	return wrapString(dns.FqdnToDomain(fqdn))
 }
 
-func ProxyDisplayType(proxyType string) string {
-	return C.ProxyDisplayName(proxyType)
+func ProxyDisplayType(proxyType string) *StringBox {
+	return wrapString(C.ProxyDisplayName(proxyType))
 }
