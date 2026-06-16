@@ -168,6 +168,25 @@ func GoVersion() *StringBox {
 	return wrapString(runtime.Version() + ", " + runtime.GOOS + "/" + runtime.GOARCH)
 }
 
+// DebugGoroutineDump returns a snapshot of ALL goroutine stacks (the same
+// output as a SIGQUIT traceback). Called from the Kotlin connect-watchdog when
+// startOrReloadService doesn't return in time: it runs on its own cgo
+// goroutine and runtime.Stack(all=true) snapshots every goroutine INCLUDING
+// the blocked Box.Start one, so we can see exactly where a connect hang is
+// stuck (field diagnosis for the boot-time / no-network hang) without device
+// access. Buffer grown until it fits.
+func DebugGoroutineDump() *StringBox {
+	for size := 1 << 20; size <= 1<<23; size <<= 1 {
+		buf := make([]byte, size)
+		n := runtime.Stack(buf, true)
+		if n < size {
+			return wrapString(string(buf[:n]))
+		}
+	}
+	buf := make([]byte, 1<<23)
+	return wrapString(string(buf[:runtime.Stack(buf, true)]))
+}
+
 func FormatBytes(length int64) *StringBox {
 	return wrapString(byteformats.FormatKBytes(uint64(length)))
 }
