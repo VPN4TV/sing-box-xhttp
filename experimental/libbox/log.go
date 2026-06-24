@@ -87,11 +87,6 @@ func redirectStderr(path string) error {
 		os.Remove(outputFile.Name())
 		return err
 	}
-	// Also capture the runtime's pre-throw stderr diagnostics (e.g. the
-	// reportZombies/badPointer span size class) into the same file — these
-	// precede the throw and SetCrashOutput does not record them. Must run
-	// while outputFile.Fd() is still open; the dup'd fd 2 survives the Close.
-	redirectCrashStderr(outputFile)
 	_ = outputFile.Close()
 	return nil
 }
