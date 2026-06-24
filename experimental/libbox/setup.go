@@ -143,6 +143,13 @@ func Setup(options *SetupOptions) (retErr error) {
 		} else {
 			fmt.Fprintf(os.Stderr, "libbox setup: open crash log non-fatal: %v\n", err)
 		}
+		// Capture the runtime's pre-throw stderr (the reportZombies/badPointer
+		// preamble with the offending span's size class) into CrashLogPath
+		// +".stderr". SetCrashOutput above records only the post-throw traceback
+		// (crashFD, written once m.dying>0); the preamble prints earlier and
+		// reaches fd 2 only. Redirecting fd 2 to its own file (not the crashFD
+		// file) avoids the two-fd offset clobber. consumeCrashLog reads it.
+		redirectCrashStderr(options.CrashLogPath)
 	}
 	return nil
 }
