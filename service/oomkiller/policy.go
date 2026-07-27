@@ -39,7 +39,7 @@ func resolvePolicyMode(ctx context.Context, options option.OOMKillerServiceOptio
 			return memoryLimit, policyModeMemoryLimit
 		}
 	}
-	if memory.AvailableSupported() {
+	if memory.AvailableAvailable() {
 		return 0, policyModeAvailable
 	}
 	return 0, policyModeNone

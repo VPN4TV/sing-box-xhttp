@@ -81,16 +81,24 @@ require (
 )
 
 require (
+	github.com/MakeNowJust/heredoc/v2 v2.0.1 // indirect
+	github.com/shadowsocks/go-shadowsocks2 v0.1.5 // indirect
+	github.com/things-go/go-socks5 v0.0.5 // indirect
+)
+
+require (
 	filippo.io/edwards25519 v1.1.0 // indirect
 	filippo.io/hpke v0.4.0 // indirect
 	github.com/RyuaNerin/go-krypto v1.3.0 // indirect
 	github.com/ajg/form v1.5.1 // indirect
 	github.com/akutz/memconn v0.1.0 // indirect
 	github.com/alexbrainman/sspi v0.0.0-20231016080023-1a75b4708caa // indirect
+	github.com/amnezia-vpn/amneziawg-go v0.2.16
 	github.com/anchore/go-lzo v0.1.0 // indirect
 	github.com/andybalholm/brotli v1.1.1 // indirect
 	github.com/anmitsu/go-shlex v0.0.0-20200514113438-38f4b401e2be // indirect
 	github.com/apernet/quic-go v0.59.1-0.20260217092621-db4786c77a22 // indirect
+	github.com/artem-russkikh/wireproxy-awg v1.0.13
 	github.com/cenkalti/backoff/v4 v4.3.0 // indirect
 	github.com/cloudflare/circl v1.6.3 // indirect
 	github.com/coreos/go-iptables v0.7.1-0.20240112124308-65c67c9f46e6 // indirect
@@ -106,6 +114,7 @@ require (
 	github.com/fxamacker/cbor/v2 v2.7.0 // indirect
 	github.com/gaissmai/bart v0.18.0 // indirect
 	github.com/ghodss/yaml v1.0.1-0.20220118164431-d8423dcdf344 // indirect
+	github.com/go-ini/ini v1.67.0
 	github.com/go-jose/go-jose/v4 v4.1.3 // indirect
 	github.com/go-json-experiment/json v0.0.0-20250813024750-ebf49471dced // indirect
 	github.com/go-ole/go-ole v1.3.0 // indirect
@@ -197,6 +206,8 @@ require (
 	go.uber.org/multierr v1.11.0 // indirect
 	go.uber.org/zap/exp v0.3.0 // indirect
 	go4.org/mem v0.0.0-20240501181205-ae6ca9944745 // indirect
+	golang.getoutline.org/sdk v0.0.21
+	golang.getoutline.org/sdk/x v0.1.0
 	golang.org/x/oauth2 v0.34.0 // indirect
 	golang.org/x/term v0.41.0 // indirect
 	golang.org/x/time v0.14.0 // indirect
