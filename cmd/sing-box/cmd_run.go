@@ -14,6 +14,8 @@ import (
 
 	"github.com/sagernet/sing-box"
 	C "github.com/sagernet/sing-box/constant"
+	_ "github.com/sagernet/sing-box/experimental/libbox" // registers the VPN4TV bridge hooks
+	"github.com/sagernet/sing-box/experimental/vpn4tvbridge"
 	"github.com/sagernet/sing-box/log"
 	"github.com/sagernet/sing-box/option"
 	E "github.com/sagernet/sing/common/exceptions"
@@ -56,6 +58,19 @@ func readConfigAt(path string) (*OptionsEntry, error) {
 	}
 	if err != nil {
 		return nil, E.Cause(err, "read config at ", path)
+	}
+	// VPN4TV: a profile may carry the embedded bridge configs under a private
+	// key; strip it before the strict parser and start the bridges with the
+	// instance (same contract the desktop daemon uses).
+	cleaned, bridgeConfig, err := vpn4tvbridge.Extract(string(configContent))
+	if err != nil {
+		return nil, E.Cause(err, "read config at ", path)
+	}
+	configContent = []byte(cleaned)
+	if !bridgeConfig.IsEmpty() {
+		if err = vpn4tvbridge.Start(bridgeConfig); err != nil {
+			return nil, err
+		}
 	}
 	options, err := json.UnmarshalExtendedContext[option.Options](globalCtx, configContent)
 	if err != nil {

@@ -90,6 +90,12 @@ func Start(config *Config) error {
 	if config.IsEmpty() {
 		return nil
 	}
+	// The hooks are installed by experimental/libbox. A binary that carries
+	// bridge configs but never linked libbox would otherwise start with the
+	// socks outbounds pointing at nothing — fail loudly instead.
+	if StartXrayHook == nil && StartOutlineHook == nil && StartWireproxyHook == nil {
+		return E.New("vpn4tv: config carries bridges but no bridge runtime is linked into this binary")
+	}
 	if len(config.Xray) > 0 && StartXrayHook != nil {
 		if err := StartXrayHook(string(config.Xray)); err != nil {
 			Stop()
