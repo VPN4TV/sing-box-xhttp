@@ -63,7 +63,15 @@ func init() {
 	sharedFlags = append(sharedFlags, "-ldflags", build_shared.LinkerFlags(currentTag, false))
 	debugFlags = append(debugFlags, "-ldflags", build_shared.LinkerFlags(currentTag, true))
 
-	sharedTags = append(sharedTags, "with_gvisor", "with_quic", "with_wireguard", "with_utls", "with_naive_outbound", "with_clash_api", "with_usbip", "with_openvpn", "with_openconnect", "badlinkname", "tfogo_checklinkname0")
+	// with_wireguard dropped: VPN4TV routes ALL WireGuard/AmneziaWG (wg://, .conf)
+	// through the in-process wireproxy bridge (amnezia-vpn/amneziawg-go ->
+	// SOCKS5; see experimental/libbox/wireproxy.go), which is independent of this
+	// tag. The sing-box-native wireguard endpoint is never emitted, so the tag
+	// only added dead code/deps. Re-add if a native wireguard outbound is needed.
+	// Upstream's with_usbip / with_openvpn / with_openconnect are also omitted:
+	// VPN4TV strips those subsystems from the clients (and they are exactly the
+	// surface that triggers store review), so shipping them would be dead weight.
+	sharedTags = append(sharedTags, "with_gvisor", "with_quic", "with_utls", "with_naive_outbound", "with_clash_api", "badlinkname", "tfogo_checklinkname0")
 	darwinTags = append(darwinTags, "with_dhcp", "grpcnotrace")
 	// memcTags = append(memcTags, "with_tailscale")
 	// Tailscale dropped: VPN4TV never uses the tailscale endpoint, and it drags
