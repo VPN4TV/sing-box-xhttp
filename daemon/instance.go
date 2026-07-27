@@ -11,6 +11,7 @@ import (
 	C "github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing-box/experimental/deprecated"
 	"github.com/sagernet/sing-box/experimental/locale"
+	"github.com/sagernet/sing-box/experimental/vpn4tvbridge"
 	"github.com/sagernet/sing-box/log"
 	"github.com/sagernet/sing-box/option"
 	"github.com/sagernet/sing/common"
@@ -33,6 +34,8 @@ type Instance struct {
 	outboundManager       adapter.OutboundManager
 	endpointManager       adapter.EndpointManager
 	logFactory            log.Factory
+	// VPN4TV: bridge configs carried by the profile, started with the instance.
+	bridgeConfig *vpn4tvbridge.Config
 }
 
 func (s *StartedService) CheckConfig(ctx context.Context, configContent string) error {
@@ -83,6 +86,14 @@ func (s *StartedService) newInstance(ctx context.Context, profileContent string,
 	ctx = service.ExtendContext(ctx)
 	service.MustRegister[deprecated.Manager](ctx, new(deprecatedManager))
 	ctx, cancel := context.WithCancel(ctx)
+	// VPN4TV: the profile may carry the embedded bridge configs (xray/outline/
+	// wireproxy) under a private key. Pull them out before parsing — sing-box
+	// rejects unknown fields — and start them below, once the config is valid.
+	profileContent, bridgeConfig, err := vpn4tvbridge.Extract(profileContent)
+	if err != nil {
+		cancel()
+		return nil, err
+	}
 	options, err := parseConfig(ctx, profileContent)
 	if err != nil {
 		cancel()
@@ -118,6 +129,7 @@ func (s *StartedService) newInstance(ctx context.Context, profileContent string,
 		ctx:                   ctx,
 		cancel:                cancel,
 		urlTestHistoryStorage: urlTestHistoryStorage,
+		bridgeConfig:          bridgeConfig,
 	}
 	boxInstance, err := box.New(box.Options{
 		Context:           ctx,
@@ -157,11 +169,20 @@ func attachInstance(ctx context.Context) *Instance {
 }
 
 func (i *Instance) Start() error {
-	return i.instance.Start()
+	// VPN4TV: bridges must listen before sing-box dials its socks outbounds.
+	if err := vpn4tvbridge.Start(i.bridgeConfig); err != nil {
+		return err
+	}
+	err := i.instance.Start()
+	if err != nil {
+		vpn4tvbridge.Stop()
+	}
+	return err
 }
 
 func (i *Instance) Close() error {
 	i.cancel()
+	vpn4tvbridge.Stop()
 	i.urlTestHistoryStorage.Close()
 	return i.instance.Close()
 }
