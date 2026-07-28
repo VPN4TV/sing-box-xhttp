@@ -23,7 +23,7 @@ import (
 
 const (
 	daemonExecutableName      = "sing-box-daemon.exe"
-	applicationExecutableName = "sing-box.exe"
+	applicationExecutableName = "VPN4TV.exe"
 	workerPipePrefix          = `\\.\pipe\sing-box-worker.`
 )
 

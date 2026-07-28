@@ -22,7 +22,7 @@ import (
 
 const (
 	updateInstallerDesktop = `winsta0\default`
-	updateProductName      = "sing-box"
+	updateProductName      = "VPN4TV"
 	seTcbPrivilege         = "SeTcbPrivilege"
 	seAssignPrimaryToken   = "SeAssignPrimaryTokenPrivilege"
 	seIncreaseQuota        = "SeIncreaseQuotaPrivilege"
