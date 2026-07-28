@@ -18,8 +18,8 @@ import (
 )
 
 const (
-	serviceDisplayName             = "sing-box Service"
-	serviceDescriptionText         = "Privileged service for sing-box"
+	serviceDisplayName             = "VPN4TV Service"
+	serviceDescriptionText         = "Privileged service for VPN4TV"
 	defaultServiceWorkingDirectory = `C:\ProgramData\sing-box-daemon`
 )
 
