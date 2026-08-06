@@ -43,6 +43,8 @@ type wireproxyConfig struct {
 }
 
 type wireproxyEndpoint struct {
+	// See outlineEndpoint.Listen — same reason, same default.
+	Listen string `json:"listen,omitempty"`
 	INI  string `json:"ini"`
 	Port int    `json:"port"`
 }
@@ -75,7 +77,7 @@ func StartWireproxyBridge(configJSON string) error {
 	}
 
 	for i, ep := range cfg.Endpoints {
-		runner, err := startOneAwgEndpoint(ep.INI, ep.Port)
+		runner, err := startOneAwgEndpoint(ep.INI, ep.Port, ep.Listen)
 		if err != nil {
 			stopWireproxyLocked()
 			return fmt.Errorf("wireproxy: endpoint %d: %w", i, err)
@@ -108,9 +110,9 @@ func stopWireproxyLocked() {
 
 // startOneAwgEndpoint parses one wg-quick INI string, brings up an
 // amneziawg-go device against a netstack tun, protects its UDP socket,
-// and spawns a SOCKS5 inbound bound to 127.0.0.127:port that dials through
+// and spawns a SOCKS5 inbound bound to <listen>:port that dials through
 // the netstack.
-func startOneAwgEndpoint(iniText string, port int) (*awgRunner, error) {
+func startOneAwgEndpoint(iniText string, port int, listen string) (*awgRunner, error) {
 	iniOpt := ini.LoadOptions{
 		Insensitive:            true,
 		AllowShadows:           true,
@@ -167,7 +169,7 @@ func startOneAwgEndpoint(iniText string, port int) (*awgRunner, error) {
 	// Protect the bound UDP sockets so WG traffic bypasses our own TUN.
 	protectAwgBind(bind)
 
-	listenAddr := fmt.Sprintf("127.0.0.127:%d", port)
+	listenAddr := fmt.Sprintf("%s:%d", endpointListenHost(listen), port)
 	ln, err := net.Listen("tcp", listenAddr)
 	if err != nil {
 		dev.Close()

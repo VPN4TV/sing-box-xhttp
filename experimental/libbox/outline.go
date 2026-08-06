@@ -40,6 +40,22 @@ type outlineConfig struct {
 type outlineEndpoint struct {
 	URL  string `json:"url"`
 	Port int    `json:"port"`
+	// Listen address for this endpoint's SOCKS5 inbound. Android and Linux bind
+	// the whole 127.0.0.0/8, so the mobile clients use 127.0.0.127 to stay clear
+	// of anything the user runs; macOS and Windows only have 127.0.0.1, where
+	// binding 127.0.0.127 fails with "can't assign requested address". Empty
+	// means the historical default, so mobile profiles keep working untouched.
+	Listen string `json:"listen,omitempty"`
+}
+
+// bridgeListenHost is what an endpoint binds when the profile does not say.
+const bridgeListenHost = "127.0.0.127"
+
+func endpointListenHost(listen string) string {
+	if listen != "" {
+		return listen
+	}
+	return bridgeListenHost
 }
 
 var (
@@ -139,7 +155,7 @@ func StartOutlineBridge(configJSON string) error {
 			stopOutlineLocked()
 			return fmt.Errorf("outline: build dialer for endpoint %d: %w", i, err)
 		}
-		listenAddr := fmt.Sprintf("127.0.0.127:%d", ep.Port)
+		listenAddr := fmt.Sprintf("%s:%d", endpointListenHost(ep.Listen), ep.Port)
 		ln, err := net.Listen("tcp", listenAddr)
 		if err != nil {
 			stopOutlineLocked()
