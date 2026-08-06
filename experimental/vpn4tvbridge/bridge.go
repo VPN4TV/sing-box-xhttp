@@ -86,6 +86,29 @@ func Extract(configContent string) (string, *Config, error) {
 // singletons in libbox, so starting replaces whatever ran before. On the first
 // failure the already-started bridges are stopped again, so a failed start
 // never leaves half a chain running.
+// Attach puts the bridge configs back into a config that Extract stripped.
+// Formatting a profile must not silently drop them: the client stores what it
+// gets back, and the bridges would be gone from the next start onwards.
+func Attach(configContent string, config *Config) (string, error) {
+	if config == nil || config.IsEmpty() {
+		return configContent, nil
+	}
+	var root map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(configContent), &root); err != nil {
+		return "", E.Cause(err, "attach bridge config")
+	}
+	encoded, err := json.Marshal(config)
+	if err != nil {
+		return "", E.Cause(err, "encode bridge config")
+	}
+	root[Key] = encoded
+	out, err := json.MarshalIndent(root, "", "  ")
+	if err != nil {
+		return "", E.Cause(err, "encode config")
+	}
+	return string(out), nil
+}
+
 func Start(config *Config) error {
 	if config.IsEmpty() {
 		return nil

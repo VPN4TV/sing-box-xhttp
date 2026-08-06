@@ -102,3 +102,51 @@ func TestStartIsNoOpWithoutConfig(t *testing.T) {
 		t.Fatalf("empty config should be a no-op: %v", err)
 	}
 }
+
+// Attach is what keeps FormatConfig from eating the bridges: the client stores
+// whatever it gets back, so a stripped config would lose them for good.
+func TestAttachRestoresBridges(t *testing.T) {
+	original := `{"log":{"level":"info"},"vpn4tv":{"outline":{"endpoints":[{"url":"ss://x@1.2.3.4:8388","port":43890}]}},"outbounds":[]}`
+
+	stripped, config, err := Extract(original)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(stripped, Key) {
+		t.Fatal("Extract left the bridge key in the config")
+	}
+
+	restored, err := Attach(stripped, config)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Round-trips: what comes back out equals what went in.
+	_, again, err := Extract(restored)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if again == nil || again.Outline == nil {
+		t.Fatal("the outline bridge did not survive the round trip")
+	}
+	if !strings.Contains(restored, "1.2.3.4:8388") {
+		t.Fatal("the endpoint was lost")
+	}
+	// The rest of the config is untouched.
+	if !strings.Contains(restored, `"level"`) {
+		t.Fatal("the log section was lost")
+	}
+}
+
+// A config without bridges must come back byte for byte, so Attach is safe to
+// call unconditionally.
+func TestAttachWithoutBridgesIsNoop(t *testing.T) {
+	plain := `{"outbounds":[]}`
+	restored, err := Attach(plain, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if restored != plain {
+		t.Fatalf("expected the config unchanged, got %s", restored)
+	}
+}

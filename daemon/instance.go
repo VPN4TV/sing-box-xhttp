@@ -41,6 +41,13 @@ type Instance struct {
 func (s *StartedService) CheckConfig(ctx context.Context, configContent string) error {
 	selectedLocale := locale.FromContext(ctx)
 	ctx, _ = locale.ContextWithLocale(s.ctx, selectedLocale.Locale)
+	// VPN4TV: the profile may carry the embedded bridge configs under a private
+	// key. newInstance already strips it before parsing; this path did not, so
+	// importing any profile with a bridge failed with `unknown field "vpn4tv"`.
+	configContent, _, err := vpn4tvbridge.Extract(configContent)
+	if err != nil {
+		return err
+	}
 	options, err := parseConfig(ctx, configContent)
 	if err != nil {
 		return err
@@ -60,6 +67,12 @@ func (s *StartedService) CheckConfig(ctx context.Context, configContent string) 
 func (s *StartedService) FormatConfig(ctx context.Context, configContent string) (string, error) {
 	selectedLocale := locale.FromContext(ctx)
 	ctx, _ = locale.ContextWithLocale(s.ctx, selectedLocale.Locale)
+	// VPN4TV: same as CheckConfig, but the bridge configs have to go back in —
+	// formatting a profile must not quietly drop them.
+	configContent, bridgeConfig, err := vpn4tvbridge.Extract(configContent)
+	if err != nil {
+		return "", err
+	}
 	options, err := parseConfig(ctx, configContent)
 	if err != nil {
 		return "", err
@@ -71,7 +84,7 @@ func (s *StartedService) FormatConfig(ctx context.Context, configContent string)
 	if err != nil {
 		return "", err
 	}
-	return buffer.String(), nil
+	return vpn4tvbridge.Attach(buffer.String(), bridgeConfig)
 }
 
 type OverrideOptions struct {
