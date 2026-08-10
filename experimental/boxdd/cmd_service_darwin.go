@@ -110,6 +110,16 @@ func plistContent(executablePath string, workingDirectory string) string {
 	builder.WriteString("\t</array>\n")
 	builder.WriteString("\t<key>RunAtLoad</key>\n\t<true/>\n")
 	builder.WriteString("\t<key>KeepAlive</key>\n\t<true/>\n")
+	// launchd hands a daemon 256 descriptors by default (`launchctl limit
+	// maxfiles`). A tunnel with a few dozen concurrent connections plus the
+	// bridges runs out almost immediately and dies with "too many open files" —
+	// mid-tunnel, leaving the routing half-configured.
+	builder.WriteString("\t<key>SoftResourceLimits</key>\n\t<dict>\n")
+	builder.WriteString("\t\t<key>NumberOfFiles</key>\n\t\t<integer>65536</integer>\n")
+	builder.WriteString("\t</dict>\n")
+	builder.WriteString("\t<key>HardResourceLimits</key>\n\t<dict>\n")
+	builder.WriteString("\t\t<key>NumberOfFiles</key>\n\t\t<integer>65536</integer>\n")
+	builder.WriteString("\t</dict>\n")
 	builder.WriteString("\t<key>ProcessType</key>\n\t<string>Interactive</string>\n")
 	builder.WriteString("</dict>\n</plist>\n")
 	return builder.String()
