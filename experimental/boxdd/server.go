@@ -111,6 +111,7 @@ func (d *Daemon) Start() error {
 			d.logger.Error("serve: ", serveError)
 		}
 	}()
+	go watchFileDescriptors(d.ctx, d.logger)
 	go d.restore()
 	return nil
 }
