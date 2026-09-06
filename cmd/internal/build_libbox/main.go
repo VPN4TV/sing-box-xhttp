@@ -176,14 +176,16 @@ func buildAndroid() {
 
 	bindTarget := getAndroidBindTarget()
 
-	// Build main variant (SDK 24)
+	// Build main variant. VPN4TV: API 23, not upstream's 24 — the app runs on
+	// Android 6 TV boxes, and nothing on the Go side needs 24 (the upstream bump
+	// came with a Kotlin-side change).
 	mainTags := append([]string{}, sharedTags...)
 	// mainTags = append(mainTags, memcTags...)
 	if debugEnabled {
 		mainTags = append(mainTags, debugTags...)
 	}
 	buildAndroidVariant(AndroidBuildConfig{
-		AndroidAPI: 24,
+		AndroidAPI: 23,
 		OutputName: "libbox.aar",
 		Tags:       mainTags,
 	}, bindTarget)
