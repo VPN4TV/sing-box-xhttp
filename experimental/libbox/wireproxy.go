@@ -10,14 +10,15 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/amnezia-vpn/amneziawg-go/conn"
-	"github.com/amnezia-vpn/amneziawg-go/device"
-	"github.com/amnezia-vpn/amneziawg-go/tun/netstack"
+	"github.com/amnezia-vpn/amneziawg-go/v3/conn"
+	"github.com/amnezia-vpn/amneziawg-go/v3/device"
+	"github.com/amnezia-vpn/amneziawg-go/v3/tun/netstack"
 	wireproxy "github.com/artem-russkikh/wireproxy-awg"
 	"github.com/go-ini/ini"
 )
 
-// Wireproxy bridge for AmneziaWG (awg 2.0) subscriptions.
+// Wireproxy bridge for AmneziaWG subscriptions (1.0 through 3.1; the INI is
+// handed over verbatim, so whatever the fork parses is supported).
 //
 // Mirrors the xray and outline bridge pattern: each WG/AWG endpoint is
 // represented as a SOCKS5 inbound on 127.0.0.127:<port> that sing-box talks

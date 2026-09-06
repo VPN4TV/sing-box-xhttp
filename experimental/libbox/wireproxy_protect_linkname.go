@@ -7,7 +7,7 @@ import (
 	"syscall"
 	_ "unsafe"
 
-	_ "github.com/amnezia-vpn/amneziawg-go/conn"
+	_ "github.com/amnezia-vpn/amneziawg-go/v3/conn"
 )
 
 // controlFn must match conn.controlFn exactly.
@@ -20,7 +20,7 @@ type controlFn = func(network, address string, c syscall.RawConn) error
 // initiation goes out through the sing-box TUN and loops back through our
 // own outbound, which never delivers the handshake to the remote peer.
 //
-//go:linkname awgControlFns github.com/amnezia-vpn/amneziawg-go/conn.controlFns
+//go:linkname awgControlFns github.com/amnezia-vpn/amneziawg-go/v3/conn.controlFns
 var awgControlFns []controlFn
 
 func init() {

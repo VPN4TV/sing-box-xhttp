@@ -1,9 +1,10 @@
 module github.com/sagernet/sing-box
 
-go 1.26
+go 1.26.0
 
 require (
 	filippo.io/age v1.3.1
+	github.com/amnezia-vpn/amneziawg-go/v3 v3.1.20260814
 	github.com/anthropics/anthropic-sdk-go v1.26.0
 	github.com/anytls/sing-anytls v0.0.11
 	github.com/caddyserver/certmagic v0.25.3-0.20260421143802-60d9d8b415d6
@@ -93,12 +94,11 @@ require (
 	github.com/ajg/form v1.5.1 // indirect
 	github.com/akutz/memconn v0.1.0 // indirect
 	github.com/alexbrainman/sspi v0.0.0-20231016080023-1a75b4708caa // indirect
-	github.com/amnezia-vpn/amneziawg-go v0.2.16
 	github.com/anchore/go-lzo v0.1.0 // indirect
 	github.com/andybalholm/brotli v1.1.1 // indirect
 	github.com/anmitsu/go-shlex v0.0.0-20200514113438-38f4b401e2be // indirect
 	github.com/apernet/quic-go v0.59.1-0.20260217092621-db4786c77a22 // indirect
-	github.com/artem-russkikh/wireproxy-awg v1.0.13
+	github.com/artem-russkikh/wireproxy-awg v1.0.18
 	github.com/cenkalti/backoff/v4 v4.3.0 // indirect
 	github.com/cloudflare/circl v1.6.3 // indirect
 	github.com/coreos/go-iptables v0.7.1-0.20240112124308-65c67c9f46e6 // indirect
@@ -206,8 +206,8 @@ require (
 	go.uber.org/multierr v1.11.0 // indirect
 	go.uber.org/zap/exp v0.3.0 // indirect
 	go4.org/mem v0.0.0-20240501181205-ae6ca9944745 // indirect
-	golang.getoutline.org/sdk v0.0.21
-	golang.getoutline.org/sdk/x v0.1.0
+	golang.getoutline.org/sdk v0.0.23
+	golang.getoutline.org/sdk/x v0.2.0
 	golang.org/x/oauth2 v0.34.0 // indirect
 	golang.org/x/term v0.41.0 // indirect
 	golang.org/x/time v0.14.0 // indirect
@@ -222,3 +222,9 @@ require (
 	lukechampine.com/blake3 v1.4.1 // indirect
 	zombiezen.com/go/capnproto2 v2.18.2+incompatible // indirect
 )
+
+// VPN4TV: amneziawg-go/v3 lists sdk/x v0.2.0 for its own outline/ package, which
+// nothing we build imports. v0.2.0's httpconnect (pulled in by x/configurl, which
+// the outline bridge uses) needs upstream quic-go 0.48 — and that cannot coexist
+// with the qpack 0.6 that sagernet/quic-go requires. Pin what we compiled against.
+replace golang.getoutline.org/sdk/x => golang.getoutline.org/sdk/x v0.1.0
