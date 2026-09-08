@@ -109,22 +109,11 @@ func newOutlineProviders() *configurl.ProviderContainer {
 func protectedNetDialer() net.Dialer {
 	return net.Dialer{
 		Control: func(network, address string, conn syscall.RawConn) error {
-			wrapper := xrayPlatformWrap // shared with xray bridge — set in NewCommandServer
-			if wrapper == nil {
-				outlineLog("protect: no platform wrapper for %s", address)
-				return nil
+			err := bridgeControl(network, address, conn)
+			if err != nil {
+				outlineLog("protect(%s) failed: %v", address, err)
 			}
-			if strings.HasPrefix(address, "127.") {
-				return nil
-			}
-			return conn.Control(func(fd uintptr) {
-				err := wrapper.AutoDetectInterfaceControl(int(fd))
-				if err != nil {
-					outlineLog("protect(%s) fd=%d failed: %v", address, fd, err)
-				} else {
-					outlineLog("protect(%s) fd=%d ok", address, fd)
-				}
-			})
+			return err
 		},
 	}
 }

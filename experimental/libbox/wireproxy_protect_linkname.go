@@ -1,9 +1,6 @@
-//go:build android || linux
-
 package libbox
 
 import (
-	"strings"
 	"syscall"
 	_ "unsafe"
 
@@ -25,15 +22,6 @@ var awgControlFns []controlFn
 
 func init() {
 	awgControlFns = append(awgControlFns, func(network, address string, c syscall.RawConn) error {
-		wrapper := xrayPlatformWrap
-		if wrapper == nil {
-			return nil
-		}
-		if strings.HasPrefix(address, "127.") || strings.HasPrefix(address, "[::1]") {
-			return nil
-		}
-		return c.Control(func(fd uintptr) {
-			_ = wrapper.AutoDetectInterfaceControl(int(fd))
-		})
+		return bridgeControl(network, address, c)
 	})
 }

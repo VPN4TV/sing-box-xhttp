@@ -12,7 +12,8 @@
 //	  "vpn4tv": {
 //	    "xray":      { ... xray-core config ... },
 //	    "outline":   { "endpoints": [ { "url": "ss://...", "port": 43890 } ] },
-//	    "wireproxy": { "endpoints": [ { "ini": "[Interface]...", "port": 44890 } ] }
+//	    "wireproxy": { "endpoints": [ { "ini": "[Interface]...", "port": 44890 } ] },
+//	    "olcrtc":    { "endpoints": [ { "url": "olcrtc://...", "port": 45890 } ] }
 //	  },
 //	  "outbounds": [ ... socks outbounds pointing at those ports ... ]
 //	}
@@ -23,6 +24,7 @@ package vpn4tvbridge
 
 import (
 	"encoding/json"
+	"syscall"
 
 	E "github.com/sagernet/sing/common/exceptions"
 )
@@ -36,10 +38,21 @@ var (
 	StartXrayHook      func(configJSON string) error
 	StartOutlineHook   func(configJSON string) error
 	StartWireproxyHook func(configJSON string) error
+	StartOlcrtcHook    func(configJSON string) error
 	StopXrayHook       func() error
 	StopOutlineHook    func() error
 	StopWireproxyHook  func() error
+	StopOlcrtcHook     func() error
 )
+
+// ProtectHook keeps a bridge socket out of the tunnel where there is no
+// platform protect call (the desktop daemon). On Android and Apple the bridges
+// go through VpnService.protect / the NE's interface control; the daemon has
+// neither, and sing-tun's auto_route sends every unbound socket of the process
+// into the TUN — a bridge dialling its own server through the tunnel it feeds
+// loops until the descriptors run out. The daemon installs sing-box's own
+// interface binder here (adapter.NetworkManager.AutoDetectInterfaceFunc).
+var ProtectHook func(network, address string, conn syscall.RawConn) error
 
 // Key is the private top-level config field carrying the bridge configs.
 const Key = "vpn4tv"
@@ -50,11 +63,15 @@ type Config struct {
 	Xray      json.RawMessage `json:"xray,omitempty"`
 	Outline   json.RawMessage `json:"outline,omitempty"`
 	Wireproxy json.RawMessage `json:"wireproxy,omitempty"`
+	// olcRTC: TCP over a WebRTC "video call" on a whitelisted meeting service.
+	// Started late (see StartLate): it dials out the moment it starts, so on
+	// the desktop it must not run before the interface binder can answer.
+	Olcrtc json.RawMessage `json:"olcrtc,omitempty"`
 }
 
 // IsEmpty reports whether there is nothing to start.
 func (c *Config) IsEmpty() bool {
-	return c == nil || (len(c.Xray) == 0 && len(c.Outline) == 0 && len(c.Wireproxy) == 0)
+	return c == nil || (len(c.Xray) == 0 && len(c.Outline) == 0 && len(c.Wireproxy) == 0 && len(c.Olcrtc) == 0)
 }
 
 // Extract pulls the "vpn4tv" key out of a profile and returns the profile
@@ -116,7 +133,7 @@ func Start(config *Config) error {
 	// The hooks are installed by experimental/libbox. A binary that carries
 	// bridge configs but never linked libbox would otherwise start with the
 	// socks outbounds pointing at nothing — fail loudly instead.
-	if StartXrayHook == nil && StartOutlineHook == nil && StartWireproxyHook == nil {
+	if StartXrayHook == nil && StartOutlineHook == nil && StartWireproxyHook == nil && StartOlcrtcHook == nil {
 		return E.New("vpn4tv: config carries bridges but no bridge runtime is linked into this binary")
 	}
 	if len(config.Xray) > 0 && StartXrayHook != nil {
@@ -140,9 +157,27 @@ func Start(config *Config) error {
 	return nil
 }
 
+// StartLate brings up the bridges that dial out as soon as they start, and so
+// must wait until the tunnel's interface binder is live. The daemon calls it
+// after the box has started; the mobile apps, whose protect call works at any
+// time, may call it right after Start.
+func StartLate(config *Config) error {
+	if config == nil || len(config.Olcrtc) == 0 {
+		return nil
+	}
+	if StartOlcrtcHook == nil {
+		return E.New("vpn4tv: config carries an olcrtc bridge but this binary was built without it")
+	}
+	if err := StartOlcrtcHook(string(config.Olcrtc)); err != nil {
+		Stop()
+		return E.Cause(err, "vpn4tv: start olcrtc bridge")
+	}
+	return nil
+}
+
 // Stop tears down every bridge. Safe to call when nothing is running.
 func Stop() {
-	for _, stop := range []func() error{StopXrayHook, StopOutlineHook, StopWireproxyHook} {
+	for _, stop := range []func() error{StopXrayHook, StopOutlineHook, StopWireproxyHook, StopOlcrtcHook} {
 		if stop != nil {
 			_ = stop()
 		}

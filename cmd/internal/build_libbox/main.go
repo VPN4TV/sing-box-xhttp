@@ -1,7 +1,9 @@
 package main
 
 import (
+	"archive/zip"
 	"flag"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -72,7 +74,11 @@ func init() {
 	// VPN4TV strips those subsystems from the clients (and they are exactly the
 	// surface that triggers store review), so shipping them would be dead weight.
 	sharedTags = append(sharedTags, "with_gvisor", "with_quic", "with_utls", "with_naive_outbound", "with_clash_api", "badlinkname", "tfogo_checklinkname0")
-	darwinTags = append(darwinTags, "with_dhcp", "grpcnotrace")
+	// olcRTC (TCP over a WebRTC "call" on a whitelisted meeting service) costs
+	// ~30 MB of pion/livekit; every Apple target and the 64-bit Android
+	// builds carry it, the 32-bit Android build (TV boxes) does not — see
+	// buildAndroid.
+	darwinTags = append(darwinTags, "with_dhcp", "grpcnotrace", "with_olcrtc")
 	// memcTags = append(memcTags, "with_tailscale")
 	// Tailscale dropped: VPN4TV never uses the tailscale endpoint, and it drags
 	// in go-json-experiment (via sagernet/tailscale/ipn) which fails to compile
@@ -184,11 +190,40 @@ func buildAndroid() {
 	if debugEnabled {
 		mainTags = append(mainTags, debugTags...)
 	}
-	buildAndroidVariant(AndroidBuildConfig{
-		AndroidAPI: 23,
-		OutputName: "libbox.aar",
-		Tags:       mainTags,
-	}, bindTarget)
+	// VPN4TV: the 64-bit ABIs get olcrtc, the 32-bit ones (TV boxes, where the
+	// library size is what hurts) do not. gomobile builds one feature set per
+	// invocation, so the two halves are built separately and the 32-bit
+	// libbox.so is then packed into the 64-bit AAR. The Java surface is the
+	// same in both — the small build keeps every export and refuses at runtime.
+	wide, narrow := splitAndroidTargets(bindTarget)
+	if len(wide) == 0 || len(narrow) == 0 {
+		tags := mainTags
+		if len(wide) > 0 {
+			tags = append(append([]string{}, mainTags...), "with_olcrtc")
+		}
+		buildAndroidVariant(AndroidBuildConfig{
+			AndroidAPI: 23,
+			OutputName: "libbox.aar",
+			Tags:       tags,
+		}, bindTarget)
+	} else {
+		buildAndroidVariant(AndroidBuildConfig{
+			AndroidAPI: 23,
+			OutputName: "libbox.aar",
+			Tags:       append(append([]string{}, mainTags...), "with_olcrtc"),
+		}, strings.Join(wide, ","))
+		buildAndroidVariant(AndroidBuildConfig{
+			AndroidAPI: 23,
+			OutputName: "libbox-narrow.aar",
+			Tags:       mainTags,
+		}, strings.Join(narrow, ","))
+		err := mergeAndroidLibraries("libbox.aar", "libbox-narrow.aar")
+		if err != nil {
+			log.Fatal(err)
+		}
+		_ = os.Remove("libbox-narrow.aar")
+		log.Info("packed the 32-bit libbox.so (without olcrtc) into libbox.aar")
+	}
 
 	// Build legacy variant (SDK 21, no naive outbound)
 	legacyTags := filterTags(sharedTags, "with_naive_outbound")
@@ -260,4 +295,95 @@ func buildApple() {
 		os.Rename("Libbox.xcframework", targetDir)
 		log.Info("copied to ", targetDir)
 	}
+}
+
+// splitAndroidTargets separates a gomobile target list into the 64-bit ABIs
+// (which get the full feature set) and the 32-bit ones. A bare "android" means
+// all four.
+func splitAndroidTargets(bindTarget string) (wide []string, narrow []string) {
+	targets := strings.Split(bindTarget, ",")
+	if bindTarget == "android" {
+		targets = []string{"android/arm", "android/arm64", "android/386", "android/amd64"}
+	}
+	for _, target := range targets {
+		switch strings.TrimSpace(target) {
+		case "android/arm64", "android/amd64":
+			wide = append(wide, target)
+		case "android/arm", "android/386":
+			narrow = append(narrow, target)
+		}
+	}
+	return
+}
+
+// mergeAndroidLibraries copies every jni/<abi>/*.so from extraPath into
+// mainPath, rewriting mainPath in place. Everything else (classes.jar, the
+// manifest, proguard rules) comes from mainPath.
+func mergeAndroidLibraries(mainPath string, extraPath string) error {
+	extra, err := zip.OpenReader(extraPath)
+	if err != nil {
+		return err
+	}
+	defer extra.Close()
+	main, err := zip.OpenReader(mainPath)
+	if err != nil {
+		return err
+	}
+	defer main.Close()
+
+	merged, err := os.CreateTemp(filepath.Dir(mainPath), "libbox-merge-*.aar")
+	if err != nil {
+		return err
+	}
+	writer := zip.NewWriter(merged)
+	copyEntry := func(file *zip.File) error {
+		header := file.FileHeader
+		out, err := writer.CreateHeader(&header)
+		if err != nil {
+			return err
+		}
+		in, err := file.Open()
+		if err != nil {
+			return err
+		}
+		defer in.Close()
+		_, err = io.Copy(out, in)
+		return err
+	}
+	isNativeLibrary := func(name string) bool {
+		return strings.HasPrefix(name, "jni/") && strings.HasSuffix(name, ".so")
+	}
+	extraLibraries := make(map[string]bool)
+	for _, file := range extra.File {
+		if isNativeLibrary(file.Name) {
+			extraLibraries[file.Name] = true
+		}
+	}
+	for _, file := range main.File {
+		if extraLibraries[file.Name] {
+			return os.ErrExist // the same ABI in both halves means the split went wrong
+		}
+		if err := copyEntry(file); err != nil {
+			return err
+		}
+	}
+	for _, file := range extra.File {
+		if !isNativeLibrary(file.Name) {
+			continue
+		}
+		if err := copyEntry(file); err != nil {
+			return err
+		}
+	}
+	if err := writer.Close(); err != nil {
+		return err
+	}
+	if err := merged.Close(); err != nil {
+		return err
+	}
+	// CreateTemp makes the file private; the AAR is a build artifact, not a secret.
+	if err := os.Chmod(merged.Name(), 0o644); err != nil {
+		return err
+	}
+	return os.Rename(merged.Name(), mainPath)
 }

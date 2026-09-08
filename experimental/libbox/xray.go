@@ -3,7 +3,6 @@ package libbox
 import (
 	"strings"
 	"sync"
-	"syscall"
 
 	"github.com/xtls/xray-core/common/net"
 	xraycore "github.com/xtls/xray-core/core"
@@ -49,20 +48,7 @@ func installXrayDialerController() error {
 	if xrayDialerInstalled {
 		return nil
 	}
-	err := xrayinternet.RegisterDialerController(func(network, address string, c syscall.RawConn) error {
-		wrapper := xrayPlatformWrap
-		if wrapper == nil {
-			return nil
-		}
-		// Skip loopback addresses — the inbound is on 127.0.0.127 and we
-		// don't want to protect that (it's local, not routed through TUN).
-		if strings.HasPrefix(address, "127.") {
-			return nil
-		}
-		return c.Control(func(fd uintptr) {
-			_ = wrapper.AutoDetectInterfaceControl(int(fd))
-		})
-	})
+	err := xrayinternet.RegisterDialerController(bridgeControl)
 	if err != nil {
 		return err
 	}

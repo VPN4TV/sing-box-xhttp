@@ -182,15 +182,30 @@ func attachInstance(ctx context.Context) *Instance {
 }
 
 func (i *Instance) Start() error {
-	// VPN4TV: bridges must listen before sing-box dials its socks outbounds.
+	// VPN4TV: the daemon has no VpnService.protect; sing-tun's auto_route sends
+	// every unbound socket of this process into the TUN, so a bridge dialling
+	// its server would loop through the tunnel it feeds. Hand the bridges the
+	// same interface binder sing-box's own dialers use.
+	if networkManager := service.FromContext[adapter.NetworkManager](i.ctx); networkManager != nil {
+		vpn4tvbridge.ProtectHook = networkManager.AutoDetectInterfaceFunc()
+	}
+	// Bridges must listen before sing-box dials its socks outbounds.
 	if err := vpn4tvbridge.Start(i.bridgeConfig); err != nil {
 		return err
 	}
 	err := i.instance.Start()
 	if err != nil {
 		vpn4tvbridge.Stop()
+		return err
 	}
-	return err
+	// olcrtc dials out the moment it starts; the binder above can only answer
+	// once the box's interface monitor is running, hence after Start.
+	if err := vpn4tvbridge.StartLate(i.bridgeConfig); err != nil {
+		vpn4tvbridge.Stop()
+		_ = i.instance.Close()
+		return err
+	}
+	return nil
 }
 
 func (i *Instance) Close() error {
