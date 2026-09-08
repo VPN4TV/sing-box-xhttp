@@ -28,9 +28,9 @@ import (
 // would loop back through the TUN and deadlock.
 
 var (
-	xrayMu             sync.Mutex
-	xrayInstance       *xraycore.Instance
-	xrayPlatformWrap   *platformInterfaceWrapper
+	xrayMu              sync.Mutex
+	xrayInstance        *xraycore.Instance
+	xrayPlatformWrap    *platformInterfaceWrapper
 	xrayDialerInstalled bool
 )
 

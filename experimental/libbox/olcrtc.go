@@ -28,8 +28,8 @@ var olcrtcDefaultDNS = []string{"77.88.8.8:53", "8.8.8.8:53"}
 const olcrtcListenTimeout = 5 * time.Second
 
 var (
-	olcrtcMu       sync.Mutex
-	olcrtcRuntimes []*olcrtcmobile.Runtime
+	olcrtcMu          sync.Mutex
+	olcrtcRuntimes    []*olcrtcmobile.Runtime
 	olcrtcProtectOnce sync.Once
 )
 

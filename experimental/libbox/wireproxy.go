@@ -46,8 +46,8 @@ type wireproxyConfig struct {
 type wireproxyEndpoint struct {
 	// See outlineEndpoint.Listen — same reason, same default.
 	Listen string `json:"listen,omitempty"`
-	INI  string `json:"ini"`
-	Port int    `json:"port"`
+	INI    string `json:"ini"`
+	Port   int    `json:"port"`
 }
 
 type awgRunner struct {
