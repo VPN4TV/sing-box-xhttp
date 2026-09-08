@@ -22,10 +22,11 @@ const olcrtcBuiltIn = true
 // the resolver most likely to still answer; Google as the general fallback.
 var olcrtcDefaultDNS = []string{"77.88.8.8:53", "8.8.8.8:53"}
 
-// How long StartOlcrtcBridge waits for the SOCKS listener (not the WebRTC
-// session — that can take a while and sing-box copes with a refused socks
-// outbound by retrying).
-const olcrtcListenTimeout = 5 * time.Second
+// The SOCKS listener only opens once the WebRTC session is up, which takes
+// as long as the meeting service takes — tens of seconds at times. Nobody
+// waits for that at start: sing-box copes with a refused socks outbound by
+// retrying, so readiness is only watched for the log. This bounds the watch.
+const olcrtcReadyWatch = 2 * time.Minute
 
 var (
 	olcrtcMu          sync.Mutex
@@ -99,11 +100,14 @@ func StartOlcrtcBridge(configJSON string) error {
 			return fmt.Errorf("olcrtc: endpoint %d: start: %w", i, err)
 		}
 		olcrtcRuntimes = append(olcrtcRuntimes, runtime)
-		if err := runtime.WaitReady(int(olcrtcListenTimeout / time.Millisecond)); err != nil {
-			stopOlcrtcLocked()
-			return fmt.Errorf("olcrtc: endpoint %d: listen: %w", i, err)
-		}
-		olcrtcLog("endpoint %d listening on %s:%d (%s via %s)", i, endpointListenHost(ep.Listen), ep.Port, ep.Listen, ep.URL[:min(len(ep.URL), 24)])
+		olcrtcLog("endpoint %d starting, SOCKS5 will open on %s:%d", i, endpointListenHost(ep.Listen), ep.Port)
+		go func(index int, r *olcrtcmobile.Runtime) {
+			if err := r.WaitReady(int(olcrtcReadyWatch / time.Millisecond)); err != nil {
+				olcrtcLog("endpoint %d not ready after %s: %v", index, olcrtcReadyWatch, err)
+				return
+			}
+			olcrtcLog("endpoint %d ready", index)
+		}(i, runtime)
 	}
 	return nil
 }

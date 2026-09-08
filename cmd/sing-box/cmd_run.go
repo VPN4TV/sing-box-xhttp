@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/sagernet/sing-box"
+	"github.com/sagernet/sing-box/adapter"
 	C "github.com/sagernet/sing-box/constant"
 	_ "github.com/sagernet/sing-box/experimental/libbox" // registers the VPN4TV bridge hooks
 	"github.com/sagernet/sing-box/experimental/vpn4tvbridge"
@@ -21,6 +22,7 @@ import (
 	E "github.com/sagernet/sing/common/exceptions"
 	"github.com/sagernet/sing/common/json"
 	"github.com/sagernet/sing/common/json/badjson"
+	"github.com/sagernet/sing/service"
 
 	"github.com/spf13/cobra"
 )
@@ -71,6 +73,8 @@ func readConfigAt(path string) (*OptionsEntry, error) {
 		if err = vpn4tvbridge.Start(bridgeConfig); err != nil {
 			return nil, err
 		}
+		// The late bridges (olcrtc) go up after the instance — see create.
+		lateBridgeConfig = bridgeConfig
 	}
 	options, err := json.UnmarshalExtendedContext[option.Options](globalCtx, configContent)
 	if err != nil {
@@ -144,6 +148,9 @@ func mergeOptionsList(optionsList []*OptionsEntry) (option.Options, error) {
 	return mergedOptions, nil
 }
 
+// VPN4TV: bridge configs whose start has to wait for the running instance.
+var lateBridgeConfig *vpn4tvbridge.Config
+
 func create(options option.Options) (*box.Box, context.CancelFunc, error) {
 	if disableColor {
 		if options.Log == nil {
@@ -176,11 +183,22 @@ func create(options option.Options) (*box.Box, context.CancelFunc, error) {
 			closeMonitor(startCtx)
 		}
 	}()
+	// VPN4TV: same contract as the desktop daemon — the bridges bind their
+	// sockets to the default interface through sing-box's own binder, and the
+	// ones that dial out immediately start only once the box is up.
+	if networkManager := service.FromContext[adapter.NetworkManager](ctx); networkManager != nil {
+		vpn4tvbridge.ProtectHook = networkManager.AutoDetectInterfaceFunc()
+	}
 	err = instance.Start()
 	finishStart()
 	if err != nil {
 		cancel()
 		return nil, nil, E.Cause(err, "start service")
+	}
+	if err = vpn4tvbridge.StartLate(lateBridgeConfig); err != nil {
+		cancel()
+		_ = instance.Close()
+		return nil, nil, err
 	}
 	return instance, cancel, nil
 }
