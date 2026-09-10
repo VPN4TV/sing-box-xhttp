@@ -198,6 +198,8 @@ func create(options option.Options) (*box.Box, context.CancelFunc, error) {
 	if err = vpn4tvbridge.StartLate(lateBridgeConfig); err != nil {
 		cancel()
 		_ = instance.Close()
+		// VPN4TV: the bridges outlive nothing — least of all a child process.
+		vpn4tvbridge.Stop()
 		return nil, nil, err
 	}
 	return instance, cancel, nil
@@ -239,6 +241,7 @@ func run() error {
 			go closeMonitor(closeCtx)
 			err = instance.Close()
 			closed()
+			vpn4tvbridge.Stop()
 			if osSignal != syscall.SIGHUP {
 				if err != nil {
 					log.Error(E.Cause(err, "sing-box did not closed properly"))

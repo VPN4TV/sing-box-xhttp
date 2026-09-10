@@ -13,7 +13,8 @@
 //	    "xray":      { ... xray-core config ... },
 //	    "outline":   { "endpoints": [ { "url": "ss://...", "port": 43890 } ] },
 //	    "wireproxy": { "endpoints": [ { "ini": "[Interface]...", "port": 44890 } ] },
-//	    "olcrtc":    { "endpoints": [ { "url": "olcrtc://...", "port": 45890 } ] }
+//	    "olcrtc":    { "endpoints": [ { "url": "olcrtc://...", "port": 45890 } ] },
+//	    "trusttunnel": { "endpoints": [ { "url": "tt://?...", "port": 46890 } ] }
 //	  },
 //	  "outbounds": [ ... socks outbounds pointing at those ports ... ]
 //	}
@@ -67,11 +68,14 @@ type Config struct {
 	// Started late (see StartLate): it dials out the moment it starts, so on
 	// the desktop it must not run before the interface binder can answer.
 	Olcrtc json.RawMessage `json:"olcrtc,omitempty"`
+	// TrustTunnel: the official CLI as a child process, desktop only (see
+	// trusttunnel.go). Started late like olcrtc — it dials out at once.
+	TrustTunnel json.RawMessage `json:"trusttunnel,omitempty"`
 }
 
 // IsEmpty reports whether there is nothing to start.
 func (c *Config) IsEmpty() bool {
-	return c == nil || (len(c.Xray) == 0 && len(c.Outline) == 0 && len(c.Wireproxy) == 0 && len(c.Olcrtc) == 0)
+	return c == nil || (len(c.Xray) == 0 && len(c.Outline) == 0 && len(c.Wireproxy) == 0 && len(c.Olcrtc) == 0 && len(c.TrustTunnel) == 0)
 }
 
 // Extract pulls the "vpn4tv" key out of a profile and returns the profile
@@ -162,22 +166,30 @@ func Start(config *Config) error {
 // after the box has started; the mobile apps, whose protect call works at any
 // time, may call it right after Start.
 func StartLate(config *Config) error {
-	if config == nil || len(config.Olcrtc) == 0 {
+	if config == nil {
 		return nil
 	}
-	if StartOlcrtcHook == nil {
-		return E.New("vpn4tv: config carries an olcrtc bridge but this binary was built without it")
+	if len(config.Olcrtc) > 0 {
+		if StartOlcrtcHook == nil {
+			return E.New("vpn4tv: config carries an olcrtc bridge but this binary was built without it")
+		}
+		if err := StartOlcrtcHook(string(config.Olcrtc)); err != nil {
+			Stop()
+			return E.Cause(err, "vpn4tv: start olcrtc bridge")
+		}
 	}
-	if err := StartOlcrtcHook(string(config.Olcrtc)); err != nil {
-		Stop()
-		return E.Cause(err, "vpn4tv: start olcrtc bridge")
+	if len(config.TrustTunnel) > 0 {
+		if err := StartTrustTunnel(string(config.TrustTunnel)); err != nil {
+			Stop()
+			return E.Cause(err, "vpn4tv: start trusttunnel bridge")
+		}
 	}
 	return nil
 }
 
 // Stop tears down every bridge. Safe to call when nothing is running.
 func Stop() {
-	for _, stop := range []func() error{StopXrayHook, StopOutlineHook, StopWireproxyHook, StopOlcrtcHook} {
+	for _, stop := range []func() error{StopXrayHook, StopOutlineHook, StopWireproxyHook, StopOlcrtcHook, StopTrustTunnel} {
 		if stop != nil {
 			_ = stop()
 		}

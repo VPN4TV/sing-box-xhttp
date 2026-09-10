@@ -170,7 +170,25 @@ func installPrivilegedHelper() (string, error) {
 	if err != nil {
 		return "", E.Cause(err, "install daemon executable")
 	}
+	// The TrustTunnel client ships next to the daemon in the app bundle and is
+	// looked for next to the running daemon — so it moves with it. Optional:
+	// a bundle without it simply cannot start tt:// links.
+	installSiblingTool(filepath.Dir(sourcePath), "trusttunnel_client")
 	return destinationPath, nil
+}
+
+// installSiblingTool copies a helper binary from the bundle next to the
+// installed daemon, root-owned like the daemon itself.
+func installSiblingTool(sourceDirectory string, name string) {
+	content, err := os.ReadFile(filepath.Join(sourceDirectory, name))
+	if err != nil {
+		return
+	}
+	target := filepath.Join(privilegedHelperDirectory, name)
+	_ = os.Remove(target)
+	if err := writeRootOwnedFile(target, content, 0o755); err != nil {
+		log.Warn(E.Cause(err, "install ", name))
+	}
 }
 
 func ensureWorkingDirectory(path string) error {
