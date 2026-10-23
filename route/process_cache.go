@@ -8,6 +8,7 @@ import (
 
 	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-box/common/process"
+	C "github.com/sagernet/sing-box/constant"
 )
 
 type processCacheKey struct {
@@ -36,7 +37,14 @@ func (r *Router) findProcessInfoCached(ctx context.Context, network string, sour
 }
 
 func (r *Router) searchProcessInfo(ctx context.Context, metadata *adapter.InboundContext) {
-	if r.processSearcher == nil || metadata.ProcessInfo != nil || !r.isLocalSource(metadata.Source.Addr) {
+	if r.processSearcher == nil || metadata.ProcessInfo != nil {
+		return
+	}
+	// On Android everything the tun delivers was sent by a socket on this
+	// device, whatever source address it carries (CLAT's 192.0.0.4, an address
+	// the interface list leaves out). Look all of it up, or a socket bound to
+	// the tun could pick such a source and skip the owner rules.
+	if !(C.IsAndroid && metadata.InboundType == C.TypeTun) && !r.isLocalSource(metadata.Source.Addr) {
 		return
 	}
 	var originDestination netip.AddrPort
