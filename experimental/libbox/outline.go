@@ -46,6 +46,10 @@ type outlineEndpoint struct {
 	// binding 127.0.0.127 fails with "can't assign requested address". Empty
 	// means the historical default, so mobile profiles keep working untouched.
 	Listen string `json:"listen,omitempty"`
+	// Optional username/password for this endpoint's SOCKS5 inbound; see
+	// bridgeSocksAuth. Empty keeps the historical no-auth inbound.
+	Username string `json:"username,omitempty"`
+	Password string `json:"password,omitempty"`
 }
 
 // bridgeListenHost is what an endpoint binds when the profile does not say.
@@ -151,7 +155,7 @@ func StartOutlineBridge(configJSON string) error {
 			return fmt.Errorf("outline: listen %s: %w", listenAddr, err)
 		}
 		outlineListeners = append(outlineListeners, ln)
-		go runOutlineSocks(ln, dialer)
+		go runOutlineSocks(ln, dialer, newBridgeSocksAuth(ep.Username, ep.Password))
 	}
 	return nil
 }
@@ -175,19 +179,19 @@ func stopOutlineLocked() {
 // connection to dialer.DialStream(realDest) where realDest comes from the
 // SOCKS CONNECT request (the outline-sdk dialer already wraps the SS endpoint,
 // so the target address must be the real website, not the SS server itself).
-func runOutlineSocks(ln net.Listener, dialer transport.StreamDialer) {
+func runOutlineSocks(ln net.Listener, dialer transport.StreamDialer, auth *bridgeSocksAuth) {
 	for {
 		client, err := ln.Accept()
 		if err != nil {
 			return // listener closed
 		}
-		go handleOutlineClient(client, dialer)
+		go handleOutlineClient(client, dialer, auth)
 	}
 }
 
-func handleOutlineClient(client net.Conn, dialer transport.StreamDialer) {
+func handleOutlineClient(client net.Conn, dialer transport.StreamDialer, auth *bridgeSocksAuth) {
 	defer client.Close()
-	realDest, err := socks5Handshake(client)
+	realDest, err := socks5Handshake(client, auth)
 	if err != nil {
 		outlineLog("socks5 handshake failed: %v", err)
 		return
@@ -208,64 +212,6 @@ func handleOutlineClient(client net.Conn, dialer transport.StreamDialer) {
 	// because sing-box doesn't read it — it only looks at REP.
 	_, _ = client.Write([]byte{0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
 	pipe(client, remote)
-}
-
-// socks5Handshake reads the greeting + the CONNECT request and returns the
-// requested destination "host:port" so the outline bridge can pass it to
-// StreamDialer.DialStream (the dialer wraps the SS endpoint, so the target
-// address is what the SS protocol expects as payload destination).
-// sing-box always sends CONNECT with ATYP=03 (domain) or 01/04 (IPv4/IPv6).
-func socks5Handshake(c net.Conn) (string, error) {
-	buf := make([]byte, 262)
-	// Greeting: VER(1) NMETHODS(1) METHODS(NMETHODS)
-	if _, err := io.ReadFull(c, buf[:2]); err != nil {
-		return "", err
-	}
-	if buf[0] != 0x05 {
-		return "", errors.New("not socks5")
-	}
-	nm := int(buf[1])
-	if _, err := io.ReadFull(c, buf[:nm]); err != nil {
-		return "", err
-	}
-	if _, err := c.Write([]byte{0x05, 0x00}); err != nil {
-		return "", err
-	}
-	// Request: VER CMD RSV ATYP DST.ADDR DST.PORT
-	if _, err := io.ReadFull(c, buf[:4]); err != nil {
-		return "", err
-	}
-	atyp := buf[3]
-	var host string
-	switch atyp {
-	case 0x01: // IPv4
-		if _, err := io.ReadFull(c, buf[:4]); err != nil {
-			return "", err
-		}
-		host = net.IP(buf[:4]).String()
-	case 0x03: // domain
-		if _, err := io.ReadFull(c, buf[:1]); err != nil {
-			return "", err
-		}
-		dlen := int(buf[0])
-		if _, err := io.ReadFull(c, buf[:dlen]); err != nil {
-			return "", err
-		}
-		host = string(buf[:dlen])
-	case 0x04: // IPv6
-		if _, err := io.ReadFull(c, buf[:16]); err != nil {
-			return "", err
-		}
-		host = net.IP(buf[:16]).String()
-	default:
-		return "", errors.New("unknown ATYP")
-	}
-	if _, err := io.ReadFull(c, buf[:2]); err != nil {
-		return "", err
-	}
-	port := int(buf[0])<<8 | int(buf[1])
-	// Use JoinHostPort so IPv6 addresses get wrapped in brackets.
-	return net.JoinHostPort(host, fmt.Sprintf("%d", port)), nil
 }
 
 // pipe copies traffic in both directions between a (client) and b (remote)

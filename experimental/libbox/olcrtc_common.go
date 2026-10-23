@@ -36,6 +36,10 @@ type olcrtcEndpoint struct {
 	// whitelist the usual public resolvers may be unreachable; empty picks the
 	// built-in list (olcrtcDefaultDNS).
 	DNS string `json:"dns,omitempty"`
+	// Optional username/password for the SOCKS5 inbound; see bridgeSocksAuth.
+	// olcrtc's own SOCKS server enforces it (constant-time, CONNECT only).
+	Username string `json:"username,omitempty"`
+	Password string `json:"password,omitempty"`
 }
 
 // olcrtcKey is a parsed olcrtc:// link. The format is the client convention

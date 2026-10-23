@@ -144,6 +144,11 @@ func newOlcrtcRuntime(ep olcrtcEndpoint) (*olcrtcmobile.Runtime, error) {
 	if err := r.SetSocksPort(ep.Port); err != nil {
 		return nil, err
 	}
+	if ep.Username != "" || ep.Password != "" {
+		if err := r.SetSocksCredentials(ep.Username, ep.Password); err != nil {
+			return nil, err
+		}
+	}
 	// Transport parameters from the link, names as in docs/uri.md.
 	switch key.Transport {
 	case "vp8channel":

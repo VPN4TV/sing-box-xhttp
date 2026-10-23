@@ -48,6 +48,9 @@ type wireproxyEndpoint struct {
 	Listen string `json:"listen,omitempty"`
 	INI    string `json:"ini"`
 	Port   int    `json:"port"`
+	// Optional username/password for the SOCKS5 inbound; see bridgeSocksAuth.
+	Username string `json:"username,omitempty"`
+	Password string `json:"password,omitempty"`
 }
 
 type awgRunner struct {
@@ -78,7 +81,7 @@ func StartWireproxyBridge(configJSON string) error {
 	}
 
 	for i, ep := range cfg.Endpoints {
-		runner, err := startOneAwgEndpoint(ep.INI, ep.Port, ep.Listen)
+		runner, err := startOneAwgEndpoint(ep.INI, ep.Port, ep.Listen, newBridgeSocksAuth(ep.Username, ep.Password))
 		if err != nil {
 			stopWireproxyLocked()
 			return fmt.Errorf("wireproxy: endpoint %d: %w", i, err)
@@ -113,7 +116,7 @@ func stopWireproxyLocked() {
 // amneziawg-go device against a netstack tun, protects its UDP socket,
 // and spawns a SOCKS5 inbound bound to <listen>:port that dials through
 // the netstack.
-func startOneAwgEndpoint(iniText string, port int, listen string) (*awgRunner, error) {
+func startOneAwgEndpoint(iniText string, port int, listen string, auth *bridgeSocksAuth) (*awgRunner, error) {
 	iniOpt := ini.LoadOptions{
 		Insensitive:            true,
 		AllowShadows:           true,
@@ -177,7 +180,7 @@ func startOneAwgEndpoint(iniText string, port int, listen string) (*awgRunner, e
 		return nil, fmt.Errorf("listen %s: %w", listenAddr, err)
 	}
 
-	go runAwgSocks(ln, tnet)
+	go runAwgSocks(ln, tnet, auth)
 
 	return &awgRunner{listener: ln, device: dev}, nil
 }
@@ -218,19 +221,19 @@ func protectAwgBind(bind conn.Bind) {
 // runAwgSocks accepts SOCKS5 clients on ln and forwards each accepted
 // connection through tnet.DialContext, which routes through the userspace
 // AmneziaWG device to the real peer.
-func runAwgSocks(ln net.Listener, tnet *netstack.Net) {
+func runAwgSocks(ln net.Listener, tnet *netstack.Net, auth *bridgeSocksAuth) {
 	for {
 		client, err := ln.Accept()
 		if err != nil {
 			return
 		}
-		go handleAwgClient(client, tnet)
+		go handleAwgClient(client, tnet, auth)
 	}
 }
 
-func handleAwgClient(client net.Conn, tnet *netstack.Net) {
+func handleAwgClient(client net.Conn, tnet *netstack.Net, auth *bridgeSocksAuth) {
 	defer client.Close()
-	realDest, err := socks5Handshake(client)
+	realDest, err := socks5Handshake(client, auth)
 	if err != nil {
 		wireproxyLog("socks5 handshake failed: %v", err)
 		return
