@@ -182,7 +182,15 @@ func attachInstance(ctx context.Context) *Instance {
 }
 
 func (i *Instance) Start() error {
-	// VPN4TV: the daemon has no VpnService.protect; sing-tun's auto_route sends
+	// VPN4TV: an instance manages only the bridges its own profile carries
+	// (the desktop daemon: the "vpn4tv" key). On Android and Apple the app
+	// starts the bridges itself, from the sidecars, before sing-box, and keeps
+	// them across a reload — so an instance without bridge config must not
+	// touch them at all.
+	if !i.ownsBridges() {
+		return i.instance.Start()
+	}
+	// The daemon has no VpnService.protect; sing-tun's auto_route sends
 	// every unbound socket of this process into the TUN, so a bridge dialling
 	// its server would loop through the tunnel it feeds. Hand the bridges the
 	// same interface binder sing-box's own dialers use.
@@ -210,9 +218,22 @@ func (i *Instance) Start() error {
 
 func (i *Instance) Close() error {
 	i.cancel()
-	vpn4tvbridge.Stop()
+	// Only the bridges this instance started. Stopping them unconditionally
+	// killed the app-managed bridges on every reload on Android: the old
+	// instance closed, took xray/outline/wireproxy/olcrtc with it, and the new
+	// one (no bridge config) started nothing — every bridged server stayed dead
+	// until the user reconnected.
+	if i.ownsBridges() {
+		vpn4tvbridge.Stop()
+	}
 	i.urlTestHistoryStorage.Close()
 	return i.instance.Close()
+}
+
+// ownsBridges reports whether this instance's profile carries bridge configs,
+// i.e. whether starting and stopping the bridges is this instance's job.
+func (i *Instance) ownsBridges() bool {
+	return !i.bridgeConfig.IsEmpty()
 }
 
 func (i *Instance) Box() *box.Box {
