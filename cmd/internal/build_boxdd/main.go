@@ -112,6 +112,12 @@ func buildTags(operatingSystem string, architecture string, cgoEnabled bool) ([]
 		return nil, E.Cause(err, "read build tags")
 	}
 	tags := strings.Split(strings.TrimSpace(string(content)), ",")
+	// A Linux daemon cross-built without cgo still gets naive through purego,
+	// like Windows: the package ships libcronet.so next to the daemon, which
+	// is the first place the loader looks.
+	if operatingSystem == "linux" && !cgoEnabled && (architecture == "amd64" || architecture == "arm64") {
+		tags = append(tags, "with_naive_outbound", "with_purego")
+	}
 	if debugEnabled {
 		tags = append(tags, "debug")
 	}
