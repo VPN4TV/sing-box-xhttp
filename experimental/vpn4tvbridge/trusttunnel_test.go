@@ -33,6 +33,10 @@ func TestDecodeDeepLink(t *testing.T) {
 	if _, err := DecodeDeepLink("tt://" + strings.TrimPrefix(testDeepLink, "tt://?")); err != nil {
 		t.Errorf("old spelling rejected: %v", err)
 	}
+	// A subscription may append "#label"; the key is the part before it.
+	if _, err := DecodeDeepLink(testDeepLink + "#US10T%20%C2%B7%20960663"); err != nil {
+		t.Errorf("labelled link rejected: %v", err)
+	}
 	for _, bad := range []string{"ss://x", "tt://?AAEB", "tt://?" + strings.TrimPrefix(testDeepLink, "tt://?")[:10]} {
 		if _, err := DecodeDeepLink(bad); err == nil {
 			t.Errorf("accepted %q", bad)

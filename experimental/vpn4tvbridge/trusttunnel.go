@@ -129,12 +129,13 @@ func decodeBool(data []byte) (bool, error) {
 	return data[0] == 1, nil
 }
 
-// DecodeDeepLink parses a tt:// or tt://? link.
+// DecodeDeepLink parses a tt:// or tt://? link; a "#label" after it is ignored.
 func DecodeDeepLink(uri string) (*DeepLink, error) {
 	if !strings.HasPrefix(uri, "tt://") {
 		return nil, errors.New("trusttunnel: not a tt:// link")
 	}
 	encoded := strings.TrimPrefix(strings.TrimPrefix(uri, "tt://"), "?")
+	encoded, _, _ = strings.Cut(encoded, "#")
 	payload, err := base64.RawURLEncoding.DecodeString(strings.TrimRight(encoded, "="))
 	if err != nil {
 		return nil, E.Cause(err, "trusttunnel: decode link")
