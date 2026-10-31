@@ -367,13 +367,14 @@ func realityPQStateFor(serverAddress string, serverName string, publicKey []byte
 }
 
 const (
-	realityPQProbeWait      = 2 * time.Second  // the longest the other handshakes wait for the probe
+	realityPQProbeWait      = 2 * time.Second  // the longest the other handshakes wait for a probe
 	realityStripSilentLimit = 2                // unanswered handshakes without the share, before it ever worked, that go back
 	realityStripRejectLimit = 3                // rejections in a row that make a working mode without the share go back
 	realityPQHoldMin        = 30 * time.Second // after both ClientHellos were rejected; doubles while that repeats
 	realityPQHoldMax        = 10 * time.Minute
 	realityPQRetryMin       = 10 * time.Minute // a doubtful mode without the share tries the share again; doubles
 	realityPQRetryMax       = 3 * time.Hour
+	realityPQRetryCalm      = time.Hour // a share that came back and lasted this long starts the retries over
 )
 
 type realityPQOutcome uint8
@@ -401,32 +402,39 @@ type realityPQResult struct {
 //
 //   - With the share, a rejection in which the target picked X25519MLKEM768 switches to the ClientHello
 //     without it at once. A rejection with any other group has nothing to do with the share. A certificate
-//     that is not valid for the server name may come from an interceptor (a captive portal): it does not
-//     overrule a mode that worked, and a mode without the share entered on it tries the share again after
-//     realityPQRetryMin, then less and less often.
+//     that is not valid for the server name may come from an interceptor (a captive portal): a mode that
+//     worked switches on it only when it comes realityStripRejectLimit times, and the mode without the share
+//     entered on it is doubtful: it tries the share again after realityPQRetryMin, then less and less often,
+//     until the share works or the target itself answers it.
 //   - Without the share, a rejection switches back while this mode has never worked, three in a row once it
 //     has. Two handshakes in a row without an answer also switch back while it has never worked.
 //   - When the server rejects both ClientHellos one after the other, the configuration is wrong (or the
 //     network intercepts TLS) rather than the share: the default mode stays for realityPQHoldMin, and a
 //     warning says what to check. A server that keeps rejecting both with its target's certificate is held
-//     twice as long each time, up to realityPQHoldMax.
+//     twice as long each time, up to realityPQHoldMax, and while it does, a rejection of the share may come
+//     from the clock of the device: the mode without the share entered on it is doubtful as well.
 //
 // While a mode has not worked yet, its first handshake runs alone and the others wait for it, up to
-// realityPQProbeWait, so the connections that start together after a start or a reload do not all fail.
+// realityPQProbeWait, so the connections that start together after a start or a reload do not all fail. A
+// probe that takes longer is taken over once by a handshake that waited for it.
 type realityPQState struct {
 	access     sync.Mutex
 	generation uint64        // results of handshakes started before the last switch are ignored
 	strip      bool          // send the ClientHello without X25519MLKEM768
 	confirmed  bool          // a handshake in the current mode got through
-	probed     bool          // the first handshake in the current mode has ended
+	probed     bool          // the probe of the current mode has ended
 	probe      chan struct{} // closed when the probe of the current mode ends
+	late       chan struct{} // the probe that took too long and was taken over, while it runs
+	relieved   bool          // a probe of the current mode was taken over
 	probeWait  time.Duration // realityPQProbeWait unless a test sets it
 	rejections int
 	silent     int
-	doubtful   bool // the mode without the share was entered on a certificate not valid for the server name
+	doubts     int  // doubtful rejections of the share since this mode worked
+	doubtful   bool // the mode without the share was entered on a rejection that may not be about the share
 	retryAt    time.Time
 	retryDelay time.Duration
 	retrying   bool
+	restored   time.Time // when a retry last brought the share back
 	heldUntil  time.Time
 	heldValid  bool // the hold came from a server that rejected both with its target's certificate
 	holds      int  // times in a row a server rejected both with its target's certificate
@@ -445,10 +453,18 @@ func (s *realityPQState) begin(ctx context.Context, now time.Time) (realityPQTic
 	if wait == 0 {
 		wait = realityPQProbeWait
 	}
+	// The waits for the probe and for the handshake that takes it over, never more than half of the own deadline.
+	total := 2 * wait
 	if deadline, hasDeadline := ctx.Deadline(); hasDeadline {
-		wait = min(wait, time.Until(deadline)/2)
+		total = min(total, time.Until(deadline)/2)
 	}
-	stop := time.Now().Add(wait)
+	start := time.Now()
+	limit := start.Add(total)
+	stop := start.Add(min(wait, total))
+	var (
+		timedOut chan struct{} // the probe this handshake waited for until its time was up
+		extended bool
+	)
 	for {
 		s.access.Lock()
 		ticket := realityPQTicket{generation: s.generation, strip: s.strip}
@@ -459,16 +475,33 @@ func (s *realityPQState) begin(ctx context.Context, now time.Time) (realityPQTic
 				s.access.Unlock()
 				return ticket, nil
 			}
-			probe := s.probe
-			s.access.Unlock()
-			remaining := time.Until(stop)
-			if remaining <= 0 {
-				return ticket, nil // the probe takes too long: go on in the current mode
+			if timedOut != nil {
+				if extended || !time.Now().Before(limit) {
+					s.access.Unlock()
+					return ticket, nil // the probes take too long: go on in the current mode
+				}
+				if s.probe == timedOut && !s.relieved {
+					// The probe takes too long: this handshake probes in its place, and the others wait for it rather
+					// than all going at once in a mode the server may reject.
+					s.relieved = true
+					s.late = s.probe
+					s.probe = make(chan struct{})
+					ticket.probe = s.probe
+					s.access.Unlock()
+					return ticket, nil
+				}
+				extended = true
+				stop = time.Now().Add(min(wait, time.Until(limit)))
+				timedOut = nil
 			}
-			timer := time.NewTimer(remaining)
+			probe, late := s.probe, s.late // the probe that was taken over may still end first
+			s.access.Unlock()
+			timer := time.NewTimer(time.Until(stop))
 			select {
 			case <-probe:
+			case <-late:
 			case <-timer.C:
+				timedOut = probe
 			case <-ctx.Done():
 				timer.Stop()
 				return realityPQTicket{}, ctx.Err()
@@ -486,14 +519,19 @@ func (s *realityPQState) begin(ctx context.Context, now time.Time) (realityPQTic
 	}
 }
 
-// end records how a handshake ended and returns what to log about a switch of the mode.
+// end records how a handshake ended and returns what to log about it.
 func (s *realityPQState) end(ticket realityPQTicket, result realityPQResult, now time.Time) (switched string, warning string) {
 	s.access.Lock()
 	defer s.access.Unlock()
+	var late bool
 	if ticket.probe != nil {
 		close(ticket.probe)
 		if s.probe == ticket.probe {
 			s.probe = nil
+		}
+		if s.late == ticket.probe {
+			s.late = nil
+			late = true
 		}
 	}
 	if ticket.retry {
@@ -503,27 +541,41 @@ func (s *realityPQState) end(ticket realityPQTicket, result realityPQResult, now
 		return
 	}
 	if ticket.retry {
-		switch result.outcome {
-		case realityPQVerified:
+		switch {
+		case result.outcome == realityPQVerified:
 			s.switchTo(false, false)
 			s.confirmed = true
 			s.holds = 0
+			s.restored = now
 			return "the server takes the ClientHello with X25519MLKEM768 again; sending it", ""
-		case realityPQCanceled:
+		case result.outcome == realityPQCanceled:
+		case result.outcome == realityPQSilent:
+			// No answer says nothing about the share: the next retry comes after the same delay.
+			s.retryAt = now.Add(s.retryDelay)
+		case result.valid && result.group == utls.X25519MLKEM768:
+			// The target itself answered the share: the server is older than Xray v25.5.16, the doubt is over.
+			s.doubtful = false
+			return "the server answered the ClientHello with X25519MLKEM768 with the certificate of its target again; it is not tried any more", ""
 		default:
 			s.retryDelay = min(2*s.retryDelay, realityPQRetryMax)
 			s.retryAt = now.Add(s.retryDelay)
 		}
 		return
 	}
-	if ticket.probe != nil && result.outcome != realityPQCanceled {
+	// The result of a probe that was taken over counts, but only the handshake that took it over ends the wait.
+	if ticket.probe != nil && !late && result.outcome != realityPQCanceled {
 		s.probed = true
 	}
 	switch result.outcome {
 	case realityPQVerified:
 		if s.strip && s.doubtful && !s.confirmed {
-			s.retryDelay = realityPQRetryMin
-			s.retryAt = now.Add(realityPQRetryMin)
+			// A target that picks X25519MLKEM768 again soon after the share came back picks it at times: the share
+			// is tried less and less often. Otherwise the retries start over.
+			if now.Sub(s.restored) >= realityPQRetryCalm {
+				s.retryDelay = 0
+			}
+			s.retryDelay = max(realityPQRetryMin, min(2*s.retryDelay, realityPQRetryMax))
+			s.retryAt = now.Add(s.retryDelay)
 		}
 		s.confirmed = true
 		s.rejections = 0
@@ -532,14 +584,27 @@ func (s *realityPQState) end(ticket realityPQTicket, result realityPQResult, now
 	case realityPQRejected:
 		s.silent = 0
 		if !s.strip {
-			if result.group != utls.X25519MLKEM768 || s.confirmed && !result.valid {
+			if result.group != utls.X25519MLKEM768 {
 				return
+			}
+			if s.confirmed && !result.valid {
+				// An interceptor answers now and then; a target that started to pick X25519MLKEM768 behind a
+				// certificate the device cannot verify answers every time.
+				s.doubts++
+				if s.doubts < realityStripRejectLimit {
+					return
+				}
 			}
 			// A hold after an interceptor answered both does not stop the target's own answer.
 			if now.Before(s.heldUntil) && (s.heldValid || !result.valid) {
 				return
 			}
-			s.switchTo(true, !result.valid)
+			if !result.valid {
+				s.switchTo(true, true)
+				return "a certificate that is not valid for the server name answered the ClientHello with X25519MLKEM768 and chose it; sending the ClientHello without it, and the one with it again later", ""
+			}
+			// While the server rejects both with its target's certificate, the clock of the device may be the cause.
+			s.switchTo(true, s.holds > 0)
 			return "the server answered with the certificate of its target, which chose X25519MLKEM768; sending the ClientHello without it", ""
 		}
 		s.rejections++
@@ -547,19 +612,28 @@ func (s *realityPQState) end(ticket realityPQTicket, result realityPQResult, now
 			return
 		}
 		if !s.confirmed {
+			switch {
+			case !result.valid:
+				warning = "the server answered both ClientHellos with a certificate that is not valid for the server name: the network may intercept TLS"
+			case s.doubtful && s.holds == 0:
+				// This mode was entered on a certificate that is not valid for the server name.
+				warning = "the server rejected the ClientHello without X25519MLKEM768, and a certificate that is not valid for the server name answered the one with it: the network may intercept TLS; otherwise check public_key, short_id, server_name and the clock of the device"
+			default:
+				warning = "the server rejected the ClientHello both with and without X25519MLKEM768: check public_key, short_id, server_name and the clock of the device"
+			}
 			// An interceptor goes away by itself: only a server that keeps rejecting both is held longer each time.
 			hold := realityPQHoldMin
 			if result.valid {
 				hold = min(realityPQHoldMin<<min(s.holds, 5), realityPQHoldMax)
 				s.holds++
-				warning = "the server rejected the ClientHello both with and without X25519MLKEM768: check public_key, short_id, server_name and the clock of the device"
-			} else {
-				warning = "the server answered both ClientHellos with a certificate that is not valid for the server name: the network may intercept TLS"
 			}
 			s.heldUntil = now.Add(hold)
 			s.heldValid = result.valid
 		}
 		s.switchTo(false, false)
+		if !result.valid {
+			return "a certificate that is not valid for the server name answered the ClientHello without X25519MLKEM768; sending the one with it again", warning
+		}
 		return "the server answered the ClientHello without X25519MLKEM768 with the certificate of its target; sending it again", warning
 	case realityPQSilent:
 		if !s.strip || s.confirmed {
@@ -581,8 +655,11 @@ func (s *realityPQState) switchTo(strip bool, doubtful bool) {
 	s.confirmed = false
 	s.probed = false
 	s.probe = nil // a probe of the old mode still running closes its own channel
+	s.late = nil
+	s.relieved = false
 	s.rejections = 0
 	s.silent = 0
+	s.doubts = 0
 }
 
 func realityClientFallback(ctx context.Context, uConn net.Conn, serverName string, fingerprint utls.ClientHelloID) {
