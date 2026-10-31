@@ -90,7 +90,11 @@ func (c *UTLSClientConfig) Client(conn net.Conn) (Conn, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &utlsALPNWrapper{utlsConnWrapper{utls.UClient(conn, c.config.Clone(), c.id)}, c.config.NextProtos}, nil
+	uConn, err := newUClient(conn, c.config.Clone(), c.id)
+	if err != nil {
+		return nil, err
+	}
+	return &utlsALPNWrapper{utlsConnWrapper{uConn}, c.config.NextProtos}, nil
 }
 
 func (c *UTLSClientConfig) SetSessionIDGenerator(generator func(clientHello []byte, sessionID []byte) error) {
@@ -352,7 +356,7 @@ var (
 
 func init() {
 	modernFingerprints := []utls.ClientHelloID{
-		utls.HelloChrome_Auto,
+		helloChrome155,
 		utls.HelloFirefox_Auto,
 		utls.HelloEdge_Auto,
 		utls.HelloSafari_Auto,
@@ -369,16 +373,20 @@ func init() {
 }
 
 func uTLSClientHelloID(name string) (utls.ClientHelloID, error) {
-	switch name {
+	// Names are matched case-insensitively, like Xray does; hellochrome_133, hellofirefox_148 and
+	// hellosafari_26_3 are the explicit names Xray v26.10.29 accepts in share links.
+	switch strings.ToLower(name) {
 	case "chrome_psk", "chrome_psk_shuffle", "chrome_padding_psk_shuffle", "chrome_pq", "chrome_pq_psk":
 		fallthrough
 	case "chrome", "":
-		return utls.HelloChrome_Auto, nil
-	case "firefox":
+		return helloChrome155, nil
+	case "chrome133", "hellochrome_133":
+		return utls.HelloChrome_133, nil
+	case "firefox", "hellofirefox_148":
 		return utls.HelloFirefox_Auto, nil
 	case "edge":
 		return utls.HelloEdge_Auto, nil
-	case "safari":
+	case "safari", "hellosafari_26_3":
 		return utls.HelloSafari_Auto, nil
 	case "360":
 		return utls.Hello360_Auto, nil

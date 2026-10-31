@@ -295,3 +295,5 @@ require (
 // the outline bridge uses) needs upstream quic-go 0.48 — and that cannot coexist
 // with the qpack 0.6 that sagernet/quic-go requires. Pin what we compiled against.
 replace golang.getoutline.org/sdk/x => golang.getoutline.org/sdk/x v0.1.0
+
+replace github.com/metacubex/utls => github.com/metacubex/utls v0.0.0-20261026164304-a6a364afbd13

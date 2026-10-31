@@ -23,7 +23,9 @@ import (
 	"net"
 	"net/http"
 	"reflect"
+	"slices"
 	"strings"
+	"sync"
 	"time"
 	"unsafe"
 
@@ -46,9 +48,11 @@ var _ ConfigCompat = (*RealityClientConfig)(nil)
 
 type RealityClientConfig struct {
 	ctx       context.Context
+	logger    logger.ContextLogger
 	uClient   *UTLSClientConfig
 	publicKey []byte
 	shortID   [8]byte
+	pq        *realityPQState
 }
 
 func NewRealityClient(ctx context.Context, logger logger.ContextLogger, serverAddress string, options option.OutboundTLSOptions) (Config, error) {
@@ -84,7 +88,14 @@ func newRealityClient(ctx context.Context, logger logger.ContextLogger, serverAd
 		return nil, E.New("invalid short_id")
 	}
 
-	var config Config = &RealityClientConfig{ctx, uClient.(*UTLSClientConfig), publicKey, shortID}
+	var config Config = &RealityClientConfig{
+		ctx:       ctx,
+		logger:    logger,
+		uClient:   uClient.(*UTLSClientConfig),
+		publicKey: publicKey,
+		shortID:   shortID,
+		pq:        &realityPQState{},
+	}
 	if options.KernelRx || options.KernelTx {
 		if !C.IsLinux {
 			return nil, E.New("kTLS is only supported on Linux")
@@ -139,27 +150,38 @@ func (e *RealityClientConfig) ClientHandshake(ctx context.Context, conn net.Conn
 	uConfig.InsecureSkipVerify = true
 	uConfig.SessionTicketsDisabled = true
 	uConfig.VerifyPeerCertificate = verifier.VerifyPeerCertificate
-	uConn := utls.UClient(conn, uConfig, e.uClient.id)
-	verifier.UConn = uConn
-	err := uConn.BuildHandshakeState()
+	uConn, err := newUClient(conn, uConfig, e.uClient.id)
 	if err != nil {
 		return nil, err
 	}
-	for _, extension := range uConn.Extensions {
-		if ce, ok := extension.(*utls.SupportedCurvesExtension); ok {
-			ce.Curves = common.Filter(ce.Curves, func(curveID utls.CurveID) bool {
-				return curveID != utls.X25519MLKEM768
-			})
-		}
-		if ks, ok := extension.(*utls.KeyShareExtension); ok {
-			ks.KeyShares = common.Filter(ks.KeyShares, func(share utls.KeyShare) bool {
-				return share.Group != utls.X25519MLKEM768
-			})
-		}
-	}
+	verifier.UConn = uConn
 	err = uConn.BuildHandshakeState()
 	if err != nil {
 		return nil, err
+	}
+	// Xray since v26.9.9 (XTLS/REALITY 8cdf7bf) rejects a ClientHello without an X25519MLKEM768 key share,
+	// while REALITY servers older than Xray v25.5.16 fail when their target picks X25519MLKEM768. Profiles
+	// that carry the hybrid share send it as the browser does; a server that rejects us switches this
+	// outbound to the other mode for the next connections. Other profiles are left as they are.
+	postQuantum := realityHasPostQuantumShare(uConn)
+	strip := !postQuantum || e.pq.stripping()
+	if strip {
+		for _, extension := range uConn.Extensions {
+			if ce, ok := extension.(*utls.SupportedCurvesExtension); ok {
+				ce.Curves = common.Filter(ce.Curves, func(curveID utls.CurveID) bool {
+					return curveID != utls.X25519MLKEM768
+				})
+			}
+			if ks, ok := extension.(*utls.KeyShareExtension); ok {
+				ks.KeyShares = common.Filter(ks.KeyShares, func(share utls.KeyShare) bool {
+					return share.Group != utls.X25519MLKEM768
+				})
+			}
+		}
+		err = uConn.BuildHandshakeState()
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	if len(uConfig.NextProtos) > 0 {
@@ -195,13 +217,9 @@ func (e *RealityClientConfig) ClientHandshake(ctx context.Context, conn net.Conn
 	if err != nil {
 		return nil, err
 	}
-	keyShareKeys := uConn.HandshakeState.State13.KeyShareKeys
-	if keyShareKeys == nil {
-		return nil, E.New("nil KeyShareKeys")
-	}
-	ecdheKey := keyShareKeys.Ecdhe
-	if ecdheKey == nil {
-		return nil, E.New("nil ecdheKey")
+	ecdheKey, err := realityECDHEKey(uConn)
+	if err != nil {
+		return nil, err
 	}
 	authKey, err := ecdheKey.ECDH(publicKey)
 	if err != nil {
@@ -225,20 +243,132 @@ func (e *RealityClientConfig) ClientHandshake(ctx context.Context, conn net.Conn
 	}
 
 	err = uConn.HandshakeContext(ctx)
+	if err == nil {
+		if debug.Enabled {
+			fmt.Printf("REALITY Conn.Verified: %v\n", verifier.verified)
+		}
+		if !verifier.verified {
+			go realityClientFallback(e.ctx, uConn, e.uClient.ServerName(), e.uClient.id)
+			err = E.New("reality verification failed")
+		}
+	}
+	if postQuantum && (err == nil || verifier.rejected) {
+		if e.pq.report(strip, err == nil) && e.logger != nil {
+			if strip {
+				e.logger.InfoContext(ctx, "reality: server rejected the ClientHello without X25519MLKEM768, sending it from now on")
+			} else {
+				e.logger.InfoContext(ctx, "reality: server rejected the ClientHello with X25519MLKEM768, no longer sending it")
+			}
+		}
+	}
 	if err != nil {
 		return nil, err
 	}
-
-	if debug.Enabled {
-		fmt.Printf("REALITY Conn.Verified: %v\n", verifier.verified)
-	}
-
-	if !verifier.verified {
-		go realityClientFallback(e.ctx, uConn, e.uClient.ServerName(), e.uClient.id)
-		return nil, E.New("reality verification failed")
-	}
-
 	return &realityClientConnWrapper{uConn}, nil
+}
+
+// x25519MLKEM768ShareSize is the client key share of X25519MLKEM768: an ML-KEM-768 encapsulation key
+// followed by an X25519 public key.
+const x25519MLKEM768ShareSize = 1184 + 32
+
+// realityHasPostQuantumShare reports whether the ClientHello offers X25519MLKEM768 both as a group and as
+// a key share placed before the X25519 share, which is what Xray since v26.9.9 requires.
+func realityHasPostQuantumShare(uConn *utls.UConn) bool {
+	var group, share bool
+	for _, extension := range uConn.Extensions {
+		switch ext := extension.(type) {
+		case *utls.SupportedCurvesExtension:
+			group = slices.Contains(ext.Curves, utls.X25519MLKEM768)
+		case *utls.KeyShareExtension:
+			for _, keyShare := range ext.KeyShares {
+				if keyShare.Group == utls.X25519 {
+					break
+				}
+				if keyShare.Group == utls.X25519MLKEM768 && len(keyShare.Data) == x25519MLKEM768ShareSize {
+					share = true
+					break
+				}
+			}
+		}
+	}
+	return group && share
+}
+
+// realityECDHEKey returns the private key of the share the REALITY server authenticates with: the
+// standalone X25519 share when there is one, otherwise the X25519 half of the X25519MLKEM768 share.
+func realityECDHEKey(uConn *utls.UConn) (*ecdh.PrivateKey, error) {
+	keyShareKeys := uConn.HandshakeState.State13.KeyShareKeys
+	if keyShareKeys == nil {
+		return nil, E.New("nil KeyShareKeys")
+	}
+	var standalone, hybrid bool
+	for _, extension := range uConn.Extensions {
+		if ks, ok := extension.(*utls.KeyShareExtension); ok {
+			for _, keyShare := range ks.KeyShares {
+				switch {
+				case keyShare.Group == utls.X25519 && len(keyShare.Data) == 32:
+					standalone = true
+				case keyShare.Group == utls.X25519MLKEM768 && len(keyShare.Data) == x25519MLKEM768ShareSize:
+					hybrid = true
+				}
+			}
+		}
+	}
+	switch {
+	case standalone:
+		// uTLS keeps the key of the first classical share only.
+		if keyShareKeys.Ecdhe == nil || keyShareKeys.Ecdhe.Curve() != ecdh.X25519() {
+			return nil, E.New("missing X25519 key share key")
+		}
+		return keyShareKeys.Ecdhe, nil
+	case hybrid && keyShareKeys.MlkemEcdhe != nil:
+		return keyShareKeys.MlkemEcdhe, nil
+	default:
+		return nil, E.New("nil ecdheKey")
+	}
+}
+
+// realityPQState remembers for one outbound whether its server takes the X25519MLKEM768 key share.
+// The mode switches after a single rejection while it has never worked with this server, and after
+// three rejections in a row once it has, so a flaky network does not flip a working server.
+type realityPQState struct {
+	access    sync.Mutex
+	strip     bool
+	confirmed bool
+	failures  int
+}
+
+func (s *realityPQState) stripping() bool {
+	s.access.Lock()
+	defer s.access.Unlock()
+	return s.strip
+}
+
+// report records the result of a handshake made in the given mode and returns true if the mode switched.
+func (s *realityPQState) report(strip bool, verified bool) bool {
+	s.access.Lock()
+	defer s.access.Unlock()
+	if strip != s.strip {
+		// started before the last switch
+		return false
+	}
+	if verified {
+		s.confirmed = true
+		s.failures = 0
+		return false
+	}
+	s.failures++
+	limit := 1
+	if s.confirmed {
+		limit = 3
+	}
+	if s.failures < limit {
+		return false
+	}
+	s.strip = !s.strip
+	s.confirmed = false
+	s.failures = 0
+	return true
 }
 
 func realityClientFallback(ctx context.Context, uConn net.Conn, serverName string, fingerprint utls.ClientHelloID) {
@@ -267,10 +397,12 @@ func realityClientFallback(ctx context.Context, uConn net.Conn, serverName strin
 
 func (e *RealityClientConfig) Clone() Config {
 	return &RealityClientConfig{
-		e.ctx,
-		e.uClient.Clone().(*UTLSClientConfig),
-		e.publicKey,
-		e.shortID,
+		ctx:       e.ctx,
+		logger:    e.logger,
+		uClient:   e.uClient.Clone().(*UTLSClientConfig),
+		publicKey: e.publicKey,
+		shortID:   e.shortID,
+		pq:        e.pq,
 	}
 }
 
@@ -279,6 +411,7 @@ type realityVerifier struct {
 	serverName string
 	authKey    []byte
 	verified   bool
+	rejected   bool // the server answered with a certificate of its target: it did not authenticate us
 }
 
 func (c *realityVerifier) VerifyPeerCertificate(rawCerts [][]byte, verifiedChains [][]*x509.Certificate) error {
@@ -292,6 +425,7 @@ func (c *realityVerifier) VerifyPeerCertificate(rawCerts [][]byte, verifiedChain
 			return nil
 		}
 	}
+	c.rejected = true
 	opts := x509.VerifyOptions{
 		DNSName:       c.serverName,
 		Intermediates: x509.NewCertPool(),
