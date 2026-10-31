@@ -219,7 +219,13 @@ func (s *StartedService) StartOrReloadService(ctx context.Context, profileConten
 	s.serviceAccess.Unlock()
 	err = instance.Start()
 	s.serviceAccess.Lock()
-	if s.serviceStatus.Status != ServiceStatus_STARTING {
+	if s.instance != instance || s.serviceStatus.Status != ServiceStatus_STARTING {
+		// The service moved on while this instance was starting. Another
+		// StartOrReloadService or a CloseService replaced it and closed it,
+		// or SetError set the status: neither the status nor the instance is
+		// this call's to change. Marking the service started would report a
+		// replacement that is still starting, and the error path would drop
+		// it and close this instance again.
 		s.serviceAccess.Unlock()
 		return nil
 	}

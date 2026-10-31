@@ -97,9 +97,15 @@ func (s *URLTest) Close() error {
 }
 
 func (s *URLTest) Now() string {
-	if tcp := s.group.loadSelectedTCP(); tcp != nil {
+	// nil until Start; readers such as the daemon's group list can ask
+	// before that.
+	group := s.group
+	if group == nil {
+		return ""
+	}
+	if tcp := group.loadSelectedTCP(); tcp != nil {
 		return tcp.Tag()
-	} else if udp := s.group.loadSelectedUDP(); udp != nil {
+	} else if udp := group.loadSelectedUDP(); udp != nil {
 		return udp.Tag()
 	}
 	return ""
