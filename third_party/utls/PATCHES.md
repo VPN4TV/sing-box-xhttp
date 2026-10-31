@@ -13,5 +13,13 @@ Changes on top of the base:
    window: compressed certificate messages larger than that failed. Ported from refraction-networking/utls
    6ad535ea592a and de505bd33437 (`io.ReadFull`, excess output and trailing input are rejected;
    u_handshake_client.go).
+3. CVE-2026-56862 (Go commit b6432317a176): after the handshake, records of KeyUpdate messages reset the
+   counter of non-advancing records, so a peer could keep the connection deriving keys forever
+   (conn.go, readRecordOrCCS).
 
 To move to a newer base, copy the module again the same way and re-apply the changes that upstream lacks.
+Check the crypto/tls fixes of the Go release branch as well:
+`gh api 'repos/golang/go/commits?sha=release-branch.go1.26&path=src/crypto/tls'`.
+
+A module that depends on this one does not inherit the replace: it has to repeat it, or Go looks for
+v1.9.0-vpn4tv.1, which exists nowhere else.

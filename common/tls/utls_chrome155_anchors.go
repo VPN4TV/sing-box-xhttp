@@ -7,6 +7,7 @@ import (
 	"crypto/x509"
 	_ "embed"
 	"encoding/pem"
+	"runtime"
 	"sync"
 
 	"github.com/sagernet/sing-box/adapter"
@@ -37,13 +38,21 @@ var chrome155AnchorCertificates = sync.OnceValue(func() []*x509.Certificate {
 	}
 })
 
+// platformVerifiesSystemPool: crypto/x509 hands a pool from SystemCertPool to the platform verifier here, and
+// any certificate added to it lets Go's own verifier overrule a rejection by the platform (revocation, distrust,
+// certificate transparency, validity period).
+const platformVerifiesSystemPool = runtime.GOOS == "darwin" || runtime.GOOS == "ios" || runtime.GOOS == "windows"
+
 // chrome155RootCAs returns pool with the certificates of the advertised trust anchor IDs added. It leaves a
-// store with its own exclusive set of anchors (mozilla, none) as it is: that choice is the user's.
+// store with its own exclusive set of anchors (mozilla, none) as it is: that choice is the user's. Where the
+// platform verifies the system roots, it stays in charge: it fetches an elided intermediate through AIA itself.
 func chrome155RootCAs(ctx context.Context, pool *x509.CertPool) *x509.CertPool {
 	if store := service.FromContext[adapter.CertificateStore](ctx); store != nil && store.ExclusiveAnchors() {
 		if kind, isKind := store.(interface{ StoreKind() string }); !isKind || kind.StoreKind() != C.CertificateStoreChrome {
 			return pool
 		}
+	} else if platformVerifiesSystemPool {
+		return pool
 	}
 	if pool == nil {
 		systemPool, err := x509.SystemCertPool()

@@ -245,8 +245,12 @@ func TestChrome155RootCAs(t *testing.T) {
 		require.NoError(t, err)
 		return config.(*UTLSClientConfig).config.RootCAs
 	}
-	//nolint:staticcheck // Subjects lists the certificates added to a pool, which is what is checked here
-	require.GreaterOrEqual(t, len(rootCAs("chrome", nil).Subjects()), len(chrome155TrustAnchorIDs))
+	if platformVerifiesSystemPool {
+		require.Nil(t, rootCAs("chrome", nil), "the platform verifier keeps the system roots")
+	} else {
+		//nolint:staticcheck // Subjects lists the certificates added to a pool, which is what is checked here
+		require.GreaterOrEqual(t, len(rootCAs("chrome", nil).Subjects()), len(chrome155TrustAnchorIDs))
+	}
 	require.Nil(t, rootCAs("firefox", nil), "other profiles keep the system roots")
 	// The user's own certificate replaces the roots, and nothing is added to it.
 	block, _ := pem.Decode(chrome155AnchorsPEM)
