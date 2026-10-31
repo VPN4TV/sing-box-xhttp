@@ -711,3 +711,293 @@ func TestRealityPQStatesShared(t *testing.T) {
 	require.NotSame(t, a, realityPQStateFor("pq-test.example", "www.example.org", key, shortID))
 	require.NotSame(t, a, realityPQStateFor("other.example", "www.example.com", key, shortID))
 }
+
+func TestRealityPQStateNoTakeOverAfterSwitch(t *testing.T) {
+	t.Parallel()
+	// Handshakes take a bit less than probeWait, and a burst waits for the probe with the share, which is rejected:
+	// when the wait of the others is over, the probe of the new mode has only begun.
+	const wait = 400 * time.Millisecond
+	handshake := 4 * wait / 5
+	burst := func(first realityPQResult, answer func(ticket realityPQTicket) realityPQResult) (probes int, longest time.Duration, rejected int, stripped int) {
+		s := realityPQState{probeWait: wait}
+		probe, err := s.begin(context.Background(), time.Now())
+		require.NoError(t, err)
+		var (
+			access sync.Mutex
+			wg     sync.WaitGroup
+		)
+		for range 5 {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				start := time.Now()
+				ticket, err := s.begin(context.Background(), time.Now())
+				if err != nil {
+					t.Error(err)
+					return
+				}
+				access.Lock()
+				if ticket.probe != nil {
+					probes++
+				} else {
+					longest = max(longest, time.Since(start))
+					if ticket.strip {
+						stripped++
+					}
+				}
+				access.Unlock()
+				time.Sleep(handshake)
+				result := answer(ticket)
+				if result.outcome == realityPQRejected {
+					access.Lock()
+					rejected++
+					access.Unlock()
+				}
+				s.end(ticket, result, time.Now())
+			}()
+		}
+		time.Sleep(handshake)
+		switched, _ := s.end(probe, first, time.Now())
+		require.NotEmpty(t, switched)
+		wg.Wait()
+		return
+	}
+	// A server older than Xray v25.5.16: the target answered the share, so the others go without it when their own
+	// wait is over, and the probe without the share is not taken over.
+	probes, longest, rejected, _ := burst(pqRejectedTarget, func(ticket realityPQTicket) realityPQResult {
+		if ticket.strip {
+			return pqVerified
+		}
+		return pqRejectedTarget
+	})
+	require.Equal(t, 1, probes, "one probe without the share")
+	require.Less(t, longest, wait+wait/3, "the others go when their own wait is over")
+	require.Zero(t, rejected)
+	// A portal answered the probe, and the server behind it is new: the doubtful mode is still waited for, so the
+	// others go with the share once the server rejected the ClientHello without it.
+	_, _, rejected, stripped := burst(pqIntercepted, func(ticket realityPQTicket) realityPQResult {
+		if ticket.strip {
+			return pqRejectedOther
+		}
+		return pqVerified
+	})
+	require.Zero(t, stripped, "a handshake went without the share before the server rejected it")
+	require.Equal(t, 2, rejected, "the probe without the share and the one that took it over")
+	// A handshake that began in the new mode still takes over its probe when that takes too long.
+	s := realityPQState{probeWait: wait / 4}
+	probe, err := s.begin(context.Background(), time.Now())
+	require.NoError(t, err)
+	switched, _ := s.end(probe, pqRejectedTarget, time.Now())
+	require.NotEmpty(t, switched)
+	hung, err := s.begin(context.Background(), time.Now())
+	require.NoError(t, err)
+	other, err := s.begin(context.Background(), time.Now())
+	require.NoError(t, err)
+	require.NotNil(t, other.probe)
+	require.True(t, other.strip)
+	s.end(other, pqVerified, time.Now())
+	s.end(hung, pqSilent, time.Now())
+}
+
+func TestRealityPQStatePortalComesBack(t *testing.T) {
+	t.Parallel()
+	// A captive portal answers both ClientHellos with its own certificate whenever the session is over, and the
+	// session ends again within realityPQRetryCalm of the share coming back. Unlike a target that picks
+	// X25519MLKEM768 at times, it answers the ClientHello without the share too: after every login the share is
+	// tried again after realityPQRetryMin, not later and later.
+	pqInterceptedOther := realityPQResult{outcome: realityPQRejected, group: utls.X25519}
+	now := time.Now()
+	var s realityPQState
+	pqStep(t, &s, pqVerified, now)
+	for session := range 5 {
+		for range realityStripRejectLimit {
+			pqStep(t, &s, pqIntercepted, now)
+		}
+		ticket, _, warning := pqStep(t, &s, pqInterceptedOther, now)
+		require.True(t, ticket.strip)
+		require.Contains(t, warning, "intercept")
+		now = now.Add(realityPQHoldMin)
+		ticket, switched, _ := pqStep(t, &s, pqIntercepted, now)
+		require.False(t, ticket.strip)
+		require.NotEmpty(t, switched)
+		// The user logs in while the ClientHello without the share is sent.
+		now = now.Add(time.Minute)
+		ticket, _, _ = pqStep(t, &s, pqVerified, now)
+		require.True(t, ticket.strip)
+		ticket, _, _ = pqStep(t, &s, pqVerified, now.Add(realityPQRetryMin-time.Second))
+		require.False(t, ticket.retry)
+		now = now.Add(realityPQRetryMin)
+		ticket, switched, _ = pqStep(t, &s, pqVerified, now)
+		require.True(t, ticket.retry, "session %d: the share is not tried again after realityPQRetryMin", session)
+		require.NotEmpty(t, switched)
+		now = now.Add(30 * time.Minute)
+	}
+}
+
+func TestRealityPQStateNeedsShareKeepsItBehindPortals(t *testing.T) {
+	t.Parallel()
+	now := time.Now()
+	// A server that needs the share (Xray v26.9.9+) behind a portal: the first portal costs one rejection of the
+	// ClientHello without the share by the server; after that portals do not take the share away.
+	var s realityPQState
+	pqStep(t, &s, pqVerified, now)
+	for range realityStripRejectLimit {
+		pqStep(t, &s, pqIntercepted, now)
+	}
+	ticket, switched, _ := pqStep(t, &s, pqRejectedOther, now)
+	require.True(t, ticket.strip)
+	require.NotEmpty(t, switched)
+	ticket, _, _ = pqStep(t, &s, pqVerified, now)
+	require.False(t, ticket.strip)
+	for episode := range 5 {
+		for range 10 {
+			ticket, switched, _ = pqStep(t, &s, pqIntercepted, now.Add(time.Duration(episode)*time.Hour))
+			require.False(t, ticket.strip)
+			require.Empty(t, switched)
+		}
+		ticket, _, _ = pqStep(t, &s, pqVerified, now.Add(time.Duration(episode)*time.Hour))
+		require.False(t, ticket.strip)
+	}
+	// A server older than Xray v25.5.16 whose target the device cannot verify still leaves the share: it never
+	// rejects the ClientHello without it.
+	var old realityPQState
+	pqStep(t, &old, pqVerified, now)
+	for range realityStripRejectLimit {
+		pqStep(t, &old, pqIntercepted, now)
+	}
+	ticket, _, _ = pqStep(t, &old, pqVerified, now)
+	require.True(t, ticket.strip)
+}
+
+// The memory that a server needs the share keeps the share behind portals, and only a rejection of the ClientHello
+// without the share by the target itself, followed by the share working, sets it.
+func TestRealityPQStateNeedsShareOnlyAfterTheTargetAnsweredWithoutIt(t *testing.T) {
+	t.Parallel()
+	now := time.Now()
+	portalStrip := realityPQResult{outcome: realityPQRejected, group: pqRejectedOther.group} // the portal, without the share
+	// A server that needs the share: the first portal still costs one rejection of the ClientHello without it.
+	var s realityPQState
+	pqStep(t, &s, pqVerified, now)
+	for range realityStripRejectLimit {
+		pqStep(t, &s, pqIntercepted, now)
+	}
+	ticket, _, warning := pqStep(t, &s, pqRejectedOther, now.Add(time.Minute))
+	require.True(t, ticket.strip)
+	require.Contains(t, warning, "intercept")
+	pqStep(t, &s, pqVerified, now.Add(time.Minute))
+	// Later portals of any length and pace leave the share alone, also after the hold of that rejection.
+	at := now.Add(time.Hour)
+	for _, portal := range []int{3, 4, 5, 12} {
+		for _, gap := range []time.Duration{time.Second, time.Minute} {
+			for range portal {
+				ticket, switched, warning := pqStep(t, &s, pqIntercepted, at)
+				require.False(t, ticket.strip)
+				require.Empty(t, switched)
+				require.Empty(t, warning)
+				at = at.Add(gap)
+			}
+			ticket, _, _ := pqStep(t, &s, pqVerified, at)
+			require.False(t, ticket.strip)
+			at = at.Add(time.Hour)
+		}
+	}
+	// The target of an old server answering the share itself still switches at once.
+	_, switched, _ := pqStep(t, &s, pqRejectedTarget, at)
+	require.NotEmpty(t, switched)
+
+	// Portal answers alone, before anything worked, do not make the server one that needs the share.
+	var p realityPQState
+	for range 4 {
+		pqStep(t, &p, pqIntercepted, now)
+		pqStep(t, &p, portalStrip, now)
+		now = now.Add(realityPQHoldMin)
+	}
+	pqStep(t, &p, pqVerified, now)
+	for range realityStripRejectLimit {
+		pqStep(t, &p, pqIntercepted, now)
+	}
+	ticket, _, _ = pqStep(t, &p, pqVerified, now)
+	require.True(t, ticket.strip, "without a rejection by the target the third doubtful rejection still leaves the share")
+}
+
+func TestRealityPQStateNewServerBehindInterceptor(t *testing.T) {
+	t.Parallel()
+	// A server that needs the share (Xray v26.9.9+) behind a network that hands some connections to an interceptor
+	// (its own certificate, X25519MLKEM768 when offered), a connection every 15 s for 24 h: the ClientHello without
+	// the share goes out once at most. The server rejects it with its target's certificate, and after that the
+	// interceptor's answers do not take the share away again.
+	start := time.Unix(1_900_000_000, 0)
+	for seed := range uint64(5) {
+		r := rand.New(rand.NewPCG(seed, 2))
+		var s realityPQState
+		var rejected int
+		for i := range 24 * 240 {
+			now := start.Add(time.Duration(i) * 15 * time.Second)
+			ticket, err := s.begin(context.Background(), now)
+			require.NoError(t, err)
+			result := pqVerified
+			switch {
+			case r.Float64() < 0.05:
+				result = pqIntercepted
+				if ticket.strip {
+					result.group = utls.X25519
+				}
+			case ticket.strip:
+				result = pqRejectedOther // the server passes the ClientHello without the share on to its target
+				rejected++
+			}
+			s.end(ticket, result, now)
+		}
+		require.LessOrEqual(t, rejected, 1, "seed %d", seed)
+	}
+	// A server older than Xray v25.5.16 never rejects the ClientHello without the share: three doubtful rejections
+	// still leave the share there (its target picks X25519MLKEM768 behind a certificate the device cannot verify).
+	var old realityPQState
+	now := time.Now()
+	pqStep(t, &old, pqVerified, now)
+	for range realityStripRejectLimit {
+		pqStep(t, &old, pqVerified, now)
+		pqStep(t, &old, pqIntercepted, now)
+	}
+	ticket, _, _ := pqStep(t, &old, pqVerified, now)
+	require.True(t, ticket.strip)
+}
+
+func TestRealityPQStateNeedsShareNotFromTheClock(t *testing.T) {
+	t.Parallel()
+	now := time.Now()
+	// The clock of the device is off, and the server rejects both ClientHellos with its target's certificate: that
+	// is not a server that needs the share. Once the clock is right, a target that starts to pick X25519MLKEM768
+	// behind a certificate the device cannot verify still takes the share away from a server older than Xray v25.5.16.
+	var s realityPQState
+	pqStep(t, &s, pqRejectedTarget, now)
+	pqStep(t, &s, pqRejectedOther, now)
+	at := now.Add(realityPQHoldMin)
+	pqStep(t, &s, pqRejectedTarget, at)
+	pqStep(t, &s, pqRejectedOther, at)
+	at = at.Add(2 * realityPQHoldMin)
+	ticket, _, _ := pqStep(t, &s, pqVerified, at)
+	require.False(t, ticket.strip)
+	require.False(t, s.needsShare)
+	for range realityStripRejectLimit {
+		pqStep(t, &s, pqIntercepted, at)
+	}
+	ticket, _, _ = pqStep(t, &s, pqVerified, at)
+	require.True(t, ticket.strip)
+	// A server that needs the share and then takes the ClientHello without it (rolled back to an old version) is
+	// one like any other again.
+	var n realityPQState
+	pqStep(t, &n, pqVerified, now)
+	for range realityStripRejectLimit {
+		pqStep(t, &n, pqIntercepted, now)
+	}
+	pqStep(t, &n, pqRejectedOther, now)
+	pqStep(t, &n, pqVerified, now)
+	require.True(t, n.needsShare)
+	at = now.Add(time.Hour)
+	_, switched, _ := pqStep(t, &n, pqRejectedTarget, at)
+	require.NotEmpty(t, switched)
+	ticket, _, _ = pqStep(t, &n, pqVerified, at)
+	require.True(t, ticket.strip)
+	require.False(t, n.needsShare)
+}
