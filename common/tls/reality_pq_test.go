@@ -1074,3 +1074,68 @@ func TestRealityPQStateNeedsShareNotFromRejectionsOfBoth(t *testing.T) {
 	}
 	require.True(t, n.needsShare)
 }
+
+// A server older than Xray v25.5.16 (its target picks X25519MLKEM768 behind a valid certificate) behind a captive
+// portal that answers the probe with the share and the probe without it, and is gone after that. The mode with the
+// share comes back because both ClientHellos were rejected, which says nothing about what the server needs: its
+// probe is rejected by the target. A burst that began before the portal answered must not go with the share before
+// that answer.
+func TestRealityPQStateSwitchBackIsNotWhatTheServerNeeds(t *testing.T) {
+	t.Parallel()
+	const wait = 400 * time.Millisecond
+	portalTook := 45 * wait / 100 // the two portal answers end at 0.9 wait
+	serverTook := 3 * wait / 10   // the probe with the share is rejected by the target at 1.2 wait
+	pqInterceptedOther := realityPQResult{outcome: realityPQRejected, group: utls.X25519}
+	for run := range 3 {
+		s := realityPQState{probeWait: wait}
+		var (
+			access   sync.Mutex
+			wg       sync.WaitGroup
+			portal   = 2
+			rejected []string
+		)
+		start := time.Now()
+		handshake := func() {
+			defer wg.Done()
+			ticket, err := s.begin(context.Background(), time.Now())
+			if err != nil {
+				t.Error(err)
+				return
+			}
+			sent := time.Since(start)
+			access.Lock()
+			byPortal := portal > 0
+			if byPortal {
+				portal--
+			}
+			access.Unlock()
+			var result realityPQResult
+			switch {
+			case byPortal:
+				time.Sleep(portalTook)
+				result = pqIntercepted
+				if ticket.strip {
+					result = pqInterceptedOther
+				}
+			case ticket.strip:
+				time.Sleep(serverTook)
+				result = pqVerified
+			default:
+				time.Sleep(serverTook)
+				result = pqRejectedTarget
+				access.Lock()
+				rejected = append(rejected, sent.Round(10*time.Millisecond).String())
+				access.Unlock()
+			}
+			s.end(ticket, result, time.Now())
+		}
+		for range 10 {
+			wg.Add(1)
+			go handshake()
+		}
+		wg.Wait()
+		// The probe with the share after the portal is rejected by the target, and the handshake that takes its place
+		// may be too; the others wait for the switch to the mode without the share.
+		require.LessOrEqual(t, len(rejected), 2, "run %d: rejected by the target with the share at %v", run, rejected)
+	}
+}

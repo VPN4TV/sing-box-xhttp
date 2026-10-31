@@ -487,9 +487,11 @@ func (s *realityPQState) begin(ctx context.Context, now time.Time) (realityPQTic
 				s.access.Unlock()
 				return ticket, nil
 			}
-			// The probe of a mode that switched while this handshake waited has only begun, and the switch told what
-			// the server needs: unless the switch is doubtful, it is neither taken over nor waited for longer.
-			switched := ticket.generation != began && !s.doubtful
+			// The probe of a mode that switched while this handshake waited has only begun. A switch to the mode without
+			// the share on the target's own answer told what the server needs: that probe is neither taken over nor
+			// waited for longer. The mode with the share after both were rejected, or after silence, is only the default
+			// again, and a doubtful mode may be wrong: those are waited for as before.
+			switched := ticket.generation != began && s.strip && !s.doubtful
 			if timedOut != nil {
 				if extended || switched || !time.Now().Before(limit) {
 					s.access.Unlock()
