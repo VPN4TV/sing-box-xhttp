@@ -428,7 +428,8 @@ type realityPQState struct {
 	retryDelay time.Duration
 	retrying   bool
 	heldUntil  time.Time
-	holds      int // times in a row both ClientHellos were rejected
+	heldValid  bool // the hold came from a server that rejected both with its target's certificate
+	holds      int  // times in a row a server rejected both with its target's certificate
 }
 
 type realityPQTicket struct {
@@ -531,7 +532,11 @@ func (s *realityPQState) end(ticket realityPQTicket, result realityPQResult, now
 	case realityPQRejected:
 		s.silent = 0
 		if !s.strip {
-			if result.group != utls.X25519MLKEM768 || now.Before(s.heldUntil) || s.confirmed && !result.valid {
+			if result.group != utls.X25519MLKEM768 || s.confirmed && !result.valid {
+				return
+			}
+			// A hold after an interceptor answered both does not stop the target's own answer.
+			if now.Before(s.heldUntil) && (s.heldValid || !result.valid) {
 				return
 			}
 			s.switchTo(true, !result.valid)
@@ -552,6 +557,7 @@ func (s *realityPQState) end(ticket realityPQTicket, result realityPQResult, now
 				warning = "the server answered both ClientHellos with a certificate that is not valid for the server name: the network may intercept TLS"
 			}
 			s.heldUntil = now.Add(hold)
+			s.heldValid = result.valid
 		}
 		s.switchTo(false, false)
 		return "the server answered the ClientHello without X25519MLKEM768 with the certificate of its target; sending it again", warning

@@ -279,12 +279,22 @@ func TestRealityPQStateBothRejected(t *testing.T) {
 		require.NotEmpty(t, switched)
 		_, _, warning = pqStep(t, &portal, pqIntercepted, at)
 		require.Contains(t, warning, "intercept")
-		_, switched, _ = pqStep(t, &portal, pqRejectedTarget, at.Add(realityPQHoldMin-time.Second))
-		require.Empty(t, switched)
+		_, switched, _ = pqStep(t, &portal, pqIntercepted, at.Add(realityPQHoldMin-time.Second))
+		require.Empty(t, switched, "the interceptor is held")
 		at = at.Add(realityPQHoldMin)
 	}
 	_, switched, _ = pqStep(t, &portal, pqRejectedTarget, at)
 	require.NotEmpty(t, switched, "the old server works once the interceptor is gone")
+	// The target's own answer does not wait for a hold that an interceptor caused.
+	var after realityPQState
+	pqStep(t, &after, pqIntercepted, now)
+	pqStep(t, &after, pqIntercepted, now)
+	_, switched, _ = pqStep(t, &after, pqIntercepted, now.Add(time.Second))
+	require.Empty(t, switched, "the interceptor itself is held")
+	_, switched, _ = pqStep(t, &after, pqRejectedTarget, now.Add(time.Second))
+	require.NotEmpty(t, switched)
+	ticket, _, _ = pqStep(t, &after, pqVerified, now.Add(time.Second))
+	require.True(t, ticket.strip)
 }
 
 func TestRealityPQStateLateAndCanceled(t *testing.T) {
