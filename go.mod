@@ -26,7 +26,7 @@ require (
 	github.com/libdns/libdns v1.1.1
 	github.com/logrusorgru/aurora v2.0.3+incompatible
 	github.com/mdlayher/netlink v1.9.0
-	github.com/metacubex/utls v1.8.7
+	github.com/metacubex/utls v1.9.0-vpn4tv.1
 	github.com/mholt/acmez/v3 v3.1.6
 	github.com/miekg/dns v1.1.72
 	github.com/openai/openai-go/v3 v3.26.0
@@ -296,4 +296,4 @@ require (
 // with the qpack 0.6 that sagernet/quic-go requires. Pin what we compiled against.
 replace golang.getoutline.org/sdk/x => golang.getoutline.org/sdk/x v0.1.0
 
-replace github.com/metacubex/utls => github.com/metacubex/utls v0.0.0-20261026164304-a6a364afbd13
+replace github.com/metacubex/utls => ./third_party/utls
