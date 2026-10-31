@@ -17,6 +17,7 @@ import (
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	mRand "math/rand"
@@ -94,7 +95,7 @@ func newRealityClient(ctx context.Context, logger logger.ContextLogger, serverAd
 		uClient:   uClient.(*UTLSClientConfig),
 		publicKey: publicKey,
 		shortID:   shortID,
-		pq:        &realityPQState{},
+		pq:        realityPQStateFor(serverAddress, uClient.ServerName(), publicKey, shortID),
 	}
 	if options.KernelRx || options.KernelTx {
 		if !C.IsLinux {
@@ -159,12 +160,34 @@ func (e *RealityClientConfig) ClientHandshake(ctx context.Context, conn net.Conn
 	if err != nil {
 		return nil, err
 	}
-	// Xray since v26.9.9 (XTLS/REALITY 8cdf7bf) rejects a ClientHello without an X25519MLKEM768 key share,
-	// while REALITY servers older than Xray v25.5.16 fail when their target picks X25519MLKEM768. Profiles
-	// that carry the hybrid share send it as the browser does; a server that rejects us switches this
-	// outbound to the other mode for the next connections. Other profiles are left as they are.
+	// Profiles that carry the X25519MLKEM768 share send it as the browser does, unless this server has shown
+	// that it needs the ClientHello without it (see realityPQState). Other profiles are left as they are.
 	postQuantum := realityHasPostQuantumShare(uConn)
-	strip := !postQuantum || e.pq.stripping()
+	strip := !postQuantum
+	var (
+		ticket   realityPQTicket
+		outcome  realityPQOutcome
+		selected utls.CurveID
+	)
+	if postQuantum {
+		ticket, err = e.pq.begin(ctx)
+		if err != nil {
+			return nil, err
+		}
+		defer func() {
+			switched, warning := e.pq.end(ticket, outcome, selected, time.Now())
+			if e.logger == nil {
+				return
+			}
+			if switched != "" {
+				e.logger.InfoContext(ctx, "reality: ", switched)
+			}
+			if warning != "" {
+				e.logger.WarnContext(ctx, "reality: ", warning)
+			}
+		}()
+		strip = ticket.strip
+	}
 	if strip {
 		for _, extension := range uConn.Extensions {
 			if ce, ok := extension.(*utls.SupportedCurvesExtension); ok {
@@ -252,14 +275,18 @@ func (e *RealityClientConfig) ClientHandshake(ctx context.Context, conn net.Conn
 			err = E.New("reality verification failed")
 		}
 	}
-	if postQuantum && (err == nil || verifier.rejected) {
-		if e.pq.report(strip, err == nil) && e.logger != nil {
-			if strip {
-				e.logger.InfoContext(ctx, "reality: server rejected the ClientHello without X25519MLKEM768, sending it from now on")
-			} else {
-				e.logger.InfoContext(ctx, "reality: server rejected the ClientHello with X25519MLKEM768, no longer sending it")
-			}
+	switch {
+	case verifier.verified:
+		outcome = realityPQVerified
+	case verifier.rejected:
+		outcome = realityPQRejected
+		if serverHello := uConn.HandshakeState.ServerHello; serverHello != nil {
+			selected = serverHello.ServerShare.Group
 		}
+	case errors.Is(err, context.Canceled):
+		outcome = realityPQCanceled
+	default:
+		outcome = realityPQSilent
 	}
 	if err != nil {
 		return nil, err
@@ -328,47 +355,157 @@ func realityECDHEKey(uConn *utls.UConn) (*ecdh.PrivateKey, error) {
 	}
 }
 
-// realityPQState remembers for one outbound whether its server takes the X25519MLKEM768 key share.
-// The mode switches after a single rejection while it has never worked with this server, and after
-// three rejections in a row once it has, so a flaky network does not flip a working server.
+// realityPQStates holds a realityPQState per REALITY server for the whole process: outbounds are created
+// anew on every reload, and what a server needs does not change with them.
+var realityPQStates sync.Map
+
+func realityPQStateFor(serverAddress string, serverName string, publicKey []byte, shortID [8]byte) *realityPQState {
+	key := strings.Join([]string{serverAddress, serverName, string(publicKey), string(shortID[:])}, "\x00")
+	state, _ := realityPQStates.LoadOrStore(key, &realityPQState{})
+	return state.(*realityPQState)
+}
+
+const (
+	realityPQSilentLimit    = 3                // unanswered handshakes with X25519MLKEM768 before trying without it
+	realityStripSilentLimit = 2                // unanswered handshakes without X25519MLKEM768 before going back
+	realityStripRejectLimit = 3                // rejections in a row that make a working mode without it go back
+	realityPQHold           = 10 * time.Minute // after the server rejected both ClientHellos
+)
+
+type realityPQOutcome uint8
+
+const (
+	realityPQCanceled realityPQOutcome = iota // the caller gave up: nothing is known about the server
+	realityPQVerified
+	realityPQRejected // the server answered with the certificate of its target
+	realityPQSilent   // the handshake ended before the server's certificate
+)
+
+// realityPQState remembers whether a REALITY server takes the X25519MLKEM768 key share. Xray since v26.9.9
+// (XTLS/REALITY 8cdf7bf) rejects a ClientHello without it. REALITY servers older than Xray v25.5.16, and
+// sing-box up to 1.11, pass on the ServerHello of their target when the target picks X25519MLKEM768, so the
+// handshake ends with the target's certificate. The ClientHello with the share, as the browser sends it, is
+// the default.
+//
+//   - With the share, a rejection in which the target picked X25519MLKEM768 switches to the ClientHello
+//     without it at once. A rejection with any other group has nothing to do with the share and changes
+//     nothing. While this mode has never worked, three handshakes in a row that end before the server's
+//     certificate also switch: some middleboxes drop a ClientHello that spans two packets.
+//   - Without the share, a rejection switches back while this mode has never worked, three in a row once it
+//     has. Two unanswered handshakes in a row also switch back while it has never worked.
+//   - When a mode without the share that has never worked is rejected, the server needs the share, or rejects
+//     us for another reason: for realityPQHold the default mode stays whatever happens. If the share had been
+//     rejected just before, the configuration is wrong rather than the share, and a warning says so.
+//
+// While a mode has not worked yet, its first handshake runs alone and the others wait for its result, so the
+// connections that start together after a start or a reload do not all fail.
 type realityPQState struct {
-	access    sync.Mutex
-	strip     bool
-	confirmed bool
-	failures  int
+	access      sync.Mutex
+	generation  uint64 // results of handshakes started before the last switch are ignored
+	strip       bool   // send the ClientHello without X25519MLKEM768
+	confirmed   bool   // a handshake in the current mode got through
+	probed      bool   // the first handshake in the current mode has ended
+	probe       chan struct{}
+	rejections  int
+	silent      int
+	afterReject bool // the current mode without the share was entered after the share was rejected
+	heldUntil   time.Time
 }
 
-func (s *realityPQState) stripping() bool {
-	s.access.Lock()
-	defer s.access.Unlock()
-	return s.strip
+type realityPQTicket struct {
+	generation uint64
+	strip      bool
+	probe      bool
 }
 
-// report records the result of a handshake made in the given mode and returns true if the mode switched.
-func (s *realityPQState) report(strip bool, verified bool) bool {
-	s.access.Lock()
-	defer s.access.Unlock()
-	if strip != s.strip {
-		// started before the last switch
-		return false
+// begin returns the mode for a new handshake. Every ticket must be passed to end.
+func (s *realityPQState) begin(ctx context.Context) (realityPQTicket, error) {
+	for {
+		s.access.Lock()
+		if s.confirmed || s.probed || s.probe == nil {
+			ticket := realityPQTicket{generation: s.generation, strip: s.strip}
+			if !s.confirmed && !s.probed {
+				s.probe = make(chan struct{})
+				ticket.probe = true
+			}
+			s.access.Unlock()
+			return ticket, nil
+		}
+		probe := s.probe
+		s.access.Unlock()
+		select {
+		case <-probe:
+		case <-ctx.Done():
+			return realityPQTicket{}, ctx.Err()
+		}
 	}
-	if verified {
+}
+
+// end records how a handshake ended and returns what to log about a switch of the mode.
+func (s *realityPQState) end(ticket realityPQTicket, outcome realityPQOutcome, group utls.CurveID, now time.Time) (switched string, warning string) {
+	s.access.Lock()
+	defer s.access.Unlock()
+	if ticket.probe {
+		close(s.probe)
+		s.probe = nil
+	}
+	if ticket.generation != s.generation {
+		return
+	}
+	if ticket.probe && outcome != realityPQCanceled {
+		s.probed = true
+	}
+	switch outcome {
+	case realityPQVerified:
 		s.confirmed = true
-		s.failures = 0
-		return false
+		s.rejections = 0
+		s.silent = 0
+	case realityPQRejected:
+		s.silent = 0
+		if !s.strip {
+			if group != utls.X25519MLKEM768 || now.Before(s.heldUntil) {
+				return
+			}
+			s.switchTo(true, true)
+			return "the server answered with the certificate of its target, which chose X25519MLKEM768; sending the ClientHello without it", ""
+		}
+		s.rejections++
+		if s.confirmed && s.rejections < realityStripRejectLimit {
+			return
+		}
+		if !s.confirmed {
+			s.heldUntil = now.Add(realityPQHold)
+			if s.afterReject {
+				warning = "the server rejected the ClientHello both with and without X25519MLKEM768: check public_key, short_id, server_name and the clock of the device"
+			}
+		}
+		s.switchTo(false, false)
+		return "the server answered the ClientHello without X25519MLKEM768 with the certificate of its target; sending it again", warning
+	case realityPQSilent:
+		if s.confirmed {
+			return
+		}
+		s.silent++
+		if s.strip && s.silent >= realityStripSilentLimit {
+			s.switchTo(false, false)
+			return "handshakes without X25519MLKEM768 got no answer either; sending it again", ""
+		}
+		if !s.strip && s.silent >= realityPQSilentLimit && !now.Before(s.heldUntil) {
+			s.switchTo(true, false)
+			return "handshakes with X25519MLKEM768 got no answer; trying the ClientHello without it", ""
+		}
 	}
-	s.failures++
-	limit := 1
-	if s.confirmed {
-		limit = 3
-	}
-	if s.failures < limit {
-		return false
-	}
-	s.strip = !s.strip
+	return
+}
+
+func (s *realityPQState) switchTo(strip bool, afterReject bool) {
+	s.generation++
+	s.strip = strip
+	s.afterReject = afterReject
 	s.confirmed = false
-	s.failures = 0
-	return true
+	s.probed = false
+	s.rejections = 0
+	s.silent = 0
 }
 
 func realityClientFallback(ctx context.Context, uConn net.Conn, serverName string, fingerprint utls.ClientHelloID) {

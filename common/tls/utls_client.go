@@ -8,6 +8,7 @@ import (
 	"crypto/x509"
 	"math/rand"
 	"net"
+	"slices"
 	"strings"
 	"time"
 
@@ -311,6 +312,9 @@ func newUTLSClient(ctx context.Context, logger logger.ContextLogger, serverAddre
 	if err != nil {
 		return nil, err
 	}
+	if id == helloChrome155 && len(certificate) == 0 && !tlsConfig.InsecureSkipVerify && !common.PtrValueOrDefault(options.Reality).Enabled {
+		tlsConfig.RootCAs = chrome155RootCAs(ctx, tlsConfig.RootCAs)
+	}
 	var config Config = &UTLSClientConfig{
 		ctx:                   ctx,
 		config:                &tlsConfig,
@@ -349,27 +353,57 @@ func newUTLSClient(ctx context.Context, logger logger.ContextLogger, serverAddre
 	return config, nil
 }
 
+// randomFingerprints are the profiles "random" picks from. All of them carry the X25519MLKEM768 share, which
+// REALITY servers since Xray v26.9.9 require: Edge 85 and iOS 14 are left out.
+var randomFingerprints = []utls.ClientHelloID{
+	helloChrome155,
+	utls.HelloFirefox_Auto,
+	utls.HelloSafari_Auto,
+}
+
 var (
 	randomFingerprint     utls.ClientHelloID
 	randomizedFingerprint utls.ClientHelloID
 )
 
 func init() {
-	modernFingerprints := []utls.ClientHelloID{
-		helloChrome155,
-		utls.HelloFirefox_Auto,
-		utls.HelloEdge_Auto,
-		utls.HelloSafari_Auto,
-		utls.HelloIOS_Auto,
-	}
-	randomFingerprint = modernFingerprints[rand.Intn(len(modernFingerprints))]
+	randomFingerprint = randomFingerprints[rand.Intn(len(randomFingerprints))]
 
 	weights := utls.DefaultWeights
 	weights.TLSVersMax_Set_VersionTLS13 = 1
 	weights.FirstKeyShare_Set_CurveP256 = 0
 	randomizedFingerprint = utls.HelloRandomized
-	randomizedFingerprint.Seed, _ = utls.NewPRNGSeed()
 	randomizedFingerprint.Weights = &weights
+	// About a third of the seeds give the X25519MLKEM768 share: take one of them, as for "random".
+	for range 64 {
+		randomizedFingerprint.Seed, _ = utls.NewPRNGSeed()
+		spec, err := utls.UTLSIdToSpec(randomizedFingerprint)
+		if err == nil && specHasPostQuantumShare(&spec) {
+			break
+		}
+	}
+}
+
+// specHasPostQuantumShare is realityHasPostQuantumShare for a spec that has not been applied yet.
+func specHasPostQuantumShare(spec *utls.ClientHelloSpec) bool {
+	var group, share bool
+	for _, extension := range spec.Extensions {
+		switch ext := extension.(type) {
+		case *utls.SupportedCurvesExtension:
+			group = slices.Contains(ext.Curves, utls.X25519MLKEM768)
+		case *utls.KeyShareExtension:
+			for _, keyShare := range ext.KeyShares {
+				if keyShare.Group == utls.X25519 {
+					break
+				}
+				if keyShare.Group == utls.X25519MLKEM768 {
+					share = true
+					break
+				}
+			}
+		}
+	}
+	return group && share
 }
 
 func uTLSClientHelloID(name string) (utls.ClientHelloID, error) {

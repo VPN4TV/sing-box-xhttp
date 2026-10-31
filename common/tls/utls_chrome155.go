@@ -91,61 +91,93 @@ func chrome155Spec() *utls.ClientHelloSpec {
 		CompressionMethods: []byte{
 			0x00, // compressionNone
 		},
-		Extensions: utls.ShuffleChromeTLSExtensions([]utls.TLSExtension{
-			&utls.UtlsGREASEExtension{},
-			&utls.SNIExtension{},
-			&utls.ExtendedMasterSecretExtension{},
-			&utls.RenegotiationInfoExtension{Renegotiation: utls.RenegotiateOnceAsClient},
-			&utls.SupportedCurvesExtension{Curves: []utls.CurveID{
-				utls.GREASE_PLACEHOLDER,
-				utls.X25519MLKEM768,
-				utls.X25519,
-				utls.CurveP256,
-				utls.CurveP384,
-			}},
-			&utls.SupportedPointsExtension{SupportedPoints: []byte{
-				0x00, // pointFormatUncompressed
-			}},
-			&utls.SessionTicketExtension{},
-			&utls.ALPNExtension{AlpnProtocols: []string{"h2", "http/1.1"}},
-			&utls.StatusRequestExtension{},
-			&utls.SignatureAlgorithmsExtension{SupportedSignatureAlgorithms: []utls.SignatureScheme{
-				greaseSignatureScheme(),
-				signatureMLDSA44,
-				signatureMLDSA65,
-				signatureMLDSA87,
-				utls.ECDSAWithP256AndSHA256,
-				utls.PSSWithSHA256,
-				utls.PKCS1WithSHA256,
-				utls.ECDSAWithP384AndSHA384,
-				utls.PSSWithSHA384,
-				utls.PKCS1WithSHA384,
-				utls.PSSWithSHA512,
-				utls.PKCS1WithSHA512,
-			}},
-			&utls.SCTExtension{},
-			&utls.KeyShareExtension{KeyShares: []utls.KeyShare{
-				{Group: utls.CurveID(utls.GREASE_PLACEHOLDER), Data: []byte{0}},
-				{Group: utls.X25519MLKEM768},
-				{Group: utls.X25519},
-			}},
-			&utls.PSKKeyExchangeModesExtension{Modes: []uint8{
-				utls.PskModeDHE,
-			}},
-			&utls.SupportedVersionsExtension{Versions: []uint16{
-				utls.GREASE_PLACEHOLDER,
-				utls.VersionTLS13,
-				utls.VersionTLS12,
-			}},
-			&utls.UtlsCompressCertExtension{Algorithms: []utls.CertCompressionAlgo{
-				utls.CertCompressionBrotli,
-			}},
-			&utls.ApplicationSettingsExtensionNew{SupportedProtocols: []string{"h2"}},
-			&utls.GenericExtension{Id: extensionTrustAnchors, Data: chrome155TrustAnchors()},
-			utls.BoringGREASEECH(),
-			&utls.UtlsGREASEExtension{},
-		}),
+		Extensions: shuffleChromeExtensions(chrome155Extensions()),
 	}
+}
+
+// chrome155Extensions returns the extensions of Chrome 155 in template order.
+func chrome155Extensions() []utls.TLSExtension {
+	return []utls.TLSExtension{
+		&utls.UtlsGREASEExtension{},
+		&utls.SNIExtension{},
+		&utls.ExtendedMasterSecretExtension{},
+		&utls.RenegotiationInfoExtension{Renegotiation: utls.RenegotiateOnceAsClient},
+		&utls.SupportedCurvesExtension{Curves: []utls.CurveID{
+			utls.GREASE_PLACEHOLDER,
+			utls.X25519MLKEM768,
+			utls.X25519,
+			utls.CurveP256,
+			utls.CurveP384,
+		}},
+		&utls.SupportedPointsExtension{SupportedPoints: []byte{
+			0x00, // pointFormatUncompressed
+		}},
+		&utls.SessionTicketExtension{},
+		&utls.ALPNExtension{AlpnProtocols: []string{"h2", "http/1.1"}},
+		&utls.StatusRequestExtension{},
+		&utls.SignatureAlgorithmsExtension{SupportedSignatureAlgorithms: []utls.SignatureScheme{
+			greaseSignatureScheme(),
+			signatureMLDSA44,
+			signatureMLDSA65,
+			signatureMLDSA87,
+			utls.ECDSAWithP256AndSHA256,
+			utls.PSSWithSHA256,
+			utls.PKCS1WithSHA256,
+			utls.ECDSAWithP384AndSHA384,
+			utls.PSSWithSHA384,
+			utls.PKCS1WithSHA384,
+			utls.PSSWithSHA512,
+			utls.PKCS1WithSHA512,
+		}},
+		&utls.SCTExtension{},
+		&utls.KeyShareExtension{KeyShares: []utls.KeyShare{
+			{Group: utls.CurveID(utls.GREASE_PLACEHOLDER), Data: []byte{0}},
+			{Group: utls.X25519MLKEM768},
+			{Group: utls.X25519},
+		}},
+		&utls.PSKKeyExchangeModesExtension{Modes: []uint8{
+			utls.PskModeDHE,
+		}},
+		&utls.SupportedVersionsExtension{Versions: []uint16{
+			utls.GREASE_PLACEHOLDER,
+			utls.VersionTLS13,
+			utls.VersionTLS12,
+		}},
+		&utls.UtlsCompressCertExtension{Algorithms: []utls.CertCompressionAlgo{
+			utls.CertCompressionBrotli,
+		}},
+		&utls.ApplicationSettingsExtensionNew{SupportedProtocols: []string{"h2"}},
+		&utls.GenericExtension{Id: extensionTrustAnchors, Data: chrome155TrustAnchors()},
+		utls.BoringGREASEECH(),
+		&utls.UtlsGREASEExtension{},
+	}
+}
+
+// shuffleChromeExtensions permutes every extension but GREASE, padding and pre_shared_key uniformly, as
+// BoringSSL does (ssl_setup_extension_permutation). utls.ShuffleChromeTLSExtensions skips the swaps that
+// involve such an extension instead, so each extension stays in its template position twice as often as
+// in Chrome, which an observer who knows the template can count.
+func shuffleChromeExtensions(extensions []utls.TLSExtension) []utls.TLSExtension {
+	var positions []int
+	for i, extension := range extensions {
+		switch extension.(type) {
+		case *utls.UtlsGREASEExtension, *utls.UtlsPaddingExtension, utls.PreSharedKeyExtension:
+		default:
+			positions = append(positions, i)
+		}
+	}
+	for i := len(positions) - 1; i > 0; i-- {
+		j := randomIndex(i + 1)
+		extensions[positions[i]], extensions[positions[j]] = extensions[positions[j]], extensions[positions[i]]
+	}
+	return extensions
+}
+
+// randomIndex returns a uniform random number in [0, n) from crypto/rand.
+func randomIndex(n int) int {
+	var data [8]byte
+	_, _ = rand.Read(data[:])
+	return int(binary.BigEndian.Uint64(data[:]) % uint64(n))
 }
 
 // greaseSignatureScheme picks a random GREASE value for signature_algorithms, as BoringSSL does per
