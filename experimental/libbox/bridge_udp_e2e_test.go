@@ -541,3 +541,84 @@ func TestBridgesRefuseUDPAssociateUnlessAsked(t *testing.T) {
 	}
 	uotRoundTrip(t, wireproxy, M.ParseSocksaddrHostPort("10.77.0.1", 7))
 }
+
+// The cap counts the sessions of the whole bridge, every endpoint together.
+func TestOutlineBridgeUDPCapCoversEveryEndpoint(t *testing.T) {
+	bridgeUDPMaxOverride.Store(1)
+	defer bridgeUDPMaxOverride.Store(0)
+	ssPort := startShadowsocksServer(t, "chacha20-ietf-poly1305", "outline-secret")
+	udpEcho := startUDPEcho(t)
+	userInfo := base64.RawURLEncoding.EncodeToString([]byte("chacha20-ietf-poly1305:outline-secret"))
+	first, second := freePort(t), freePort(t)
+	var endpoints []outlineEndpoint
+	for _, port := range []int{first, second} {
+		endpoints = append(endpoints, outlineEndpoint{
+			URL:      fmt.Sprintf("ss://%s@127.0.0.1:%d/#cap", userInfo, ssPort),
+			Port:     port,
+			Listen:   "127.0.0.1",
+			Username: "bridge",
+			Password: "pass-1234",
+		})
+	}
+	config, _ := json.Marshal(outlineConfig{Endpoints: endpoints})
+	if err := StartOutlineBridge(string(config)); err != nil {
+		t.Fatal(err)
+	}
+	defer StopOutlineBridge()
+	conn, raw, err := dialUoTRaw(M.ParseSocksaddrHostPort("127.0.0.1", uint16(first)), udpEcho)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer raw.Close()
+	if err := uotEcho(conn, udpEcho, []byte("first endpoint")); err != nil {
+		t.Fatal(err)
+	}
+	if _, raw2, err := dialUoTRaw(M.ParseSocksaddrHostPort("127.0.0.1", uint16(second)), udpEcho); err == nil {
+		raw2.Close()
+		t.Fatal("the second endpoint opened a session over the bridge's cap")
+	}
+	if log := OutlineLog().Value; !strings.Contains(log, "udp: 1 sessions at once, the limit of this bridge") {
+		t.Fatalf("bridge log:\n%s", log)
+	}
+}
+
+// A datagram from the tunnel larger than the session's buffer — it came in
+// fragments past four MTUs — is dropped, not passed on cut short; the
+// session goes on.
+func TestWireproxyBridgeDropsOversizedDatagrams(t *testing.T) {
+	ini := startWireGuardServer(t)
+	bridgePort := freePort(t)
+	config, _ := json.Marshal(wireproxyConfig{Endpoints: []wireproxyEndpoint{{
+		INI:      ini,
+		Port:     bridgePort,
+		Listen:   "127.0.0.1",
+		Username: "bridge",
+		Password: "pass-1234",
+	}}})
+	if err := StartWireproxyBridge(string(config)); err != nil {
+		t.Fatal(err)
+	}
+	defer StopWireproxyBridge()
+	echo := M.ParseSocksaddrHostPort("10.77.0.1", 7)
+	conn, raw, err := dialUoTRaw(M.ParseSocksaddrHostPort("127.0.0.1", uint16(bridgePort)), echo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer raw.Close()
+	limit := awgMaxDatagram(1420)
+	if _, err := conn.WriteTo(make([]byte, limit+500), echo); err != nil {
+		t.Fatal(err)
+	}
+	_ = conn.SetReadDeadline(time.Now().Add(1500 * time.Millisecond))
+	if n, _, err := conn.ReadFrom(make([]byte, 65536)); err == nil {
+		t.Fatalf("a %d-byte answer came through, cut to %d", limit+500, n)
+	}
+	_ = conn.SetReadDeadline(time.Time{})
+	if err := uotEcho(conn, echo, make([]byte, limit)); err != nil {
+		t.Fatalf("a datagram of exactly %d bytes: %v", limit, err)
+	}
+	want := fmt.Sprintf("udp: a datagram over %d bytes from", limit)
+	if log := WireproxyLog().Value; !strings.Contains(log, want) {
+		t.Fatalf("bridge log lacks %q:\n%s", want, log)
+	}
+}

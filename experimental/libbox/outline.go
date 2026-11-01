@@ -150,6 +150,8 @@ func StartOutlineBridge(configJSON string) error {
 	}
 
 	providers := newOutlineProviders()
+	// One cap on UDP sessions for the whole bridge.
+	sessions := newBridgeUDPSessions(outlineLog)
 	for i, ep := range cfg.Endpoints {
 		dialer, err := providers.NewStreamDialer(context.Background(), ep.URL)
 		if err != nil {
@@ -159,6 +161,7 @@ func StartOutlineBridge(configJSON string) error {
 		udp := &bridgeUDP{
 			open:      newOutlinePacketOpener(providers, ep.URL, i),
 			associate: ep.UDPAssociate,
+			sessions:  sessions,
 			logf:      outlineLog,
 		}
 		listenAddr := fmt.Sprintf("%s:%d", endpointListenHost(ep.Listen), ep.Port)
@@ -203,6 +206,15 @@ func newOutlinePacketOpener(providers *configurl.ProviderContainer, url string, 
 	}
 }
 
+// outlineMaxDatagram is the most outline-sdk hands back from one read: it
+// decrypts into a 16 KiB buffer of its own (clientUDPBufferSize in
+// transport/shadowsocks), salt, tag and address included.
+const outlineMaxDatagram = 16 * 1024
+
+// outlinePacketBuffers holds the read buffers of the sessions: a datagram from
+// the server with room for a SOCKS header in front.
+var outlinePacketBuffers = newBridgeBufferPool(socks5UDPMaxHeader + outlineMaxDatagram)
+
 // outlinePacketSession is one Shadowsocks UDP association: a connected UDP
 // socket to the server, every datagram carrying its own target address.
 type outlinePacketSession struct {
@@ -218,8 +230,8 @@ func (s *outlinePacketSession) WriteTo(p []byte, dest M.Socksaddr) error {
 func (s *outlinePacketSession) Close() error { return s.conn.Close() }
 
 func (s *outlinePacketSession) read(handler bridgePacketHandler) {
-	b := getPacketBuffer()
-	defer putPacketBuffer(b)
+	b := outlinePacketBuffers.get()
+	defer outlinePacketBuffers.put(b)
 	failures := 0
 	for {
 		n, addr, err := s.conn.ReadFrom((*b)[socks5UDPMaxHeader:])

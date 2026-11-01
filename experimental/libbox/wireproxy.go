@@ -10,6 +10,7 @@ import (
 	"net/netip"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/amnezia-vpn/amneziawg-go/v3/conn"
@@ -86,8 +87,10 @@ func StartWireproxyBridge(configJSON string) error {
 		return errors.New("wireproxy: no endpoints")
 	}
 
+	// One cap on UDP sessions for the whole bridge.
+	sessions := newBridgeUDPSessions(wireproxyLog)
 	for i, ep := range cfg.Endpoints {
-		runner, err := startOneAwgEndpoint(ep)
+		runner, err := startOneAwgEndpoint(ep, sessions)
 		if err != nil {
 			stopWireproxyLocked()
 			return fmt.Errorf("wireproxy: endpoint %d: %w", i, err)
@@ -122,7 +125,7 @@ func stopWireproxyLocked() {
 // amneziawg-go device against a netstack tun, protects its UDP socket,
 // and spawns a SOCKS5 inbound bound to <listen>:port that dials through
 // the netstack.
-func startOneAwgEndpoint(ep wireproxyEndpoint) (*awgRunner, error) {
+func startOneAwgEndpoint(ep wireproxyEndpoint, sessions *bridgeUDPSessions) (*awgRunner, error) {
 	iniOpt := ini.LoadOptions{
 		Insensitive:            true,
 		AllowShadows:           true,
@@ -187,8 +190,9 @@ func startOneAwgEndpoint(ep wireproxyEndpoint) (*awgRunner, error) {
 	}
 
 	udp := &bridgeUDP{
-		open:      newAwgPacketOpener(tnet, ipcRequest.DeviceAddr),
+		open:      newAwgPacketOpener(tnet, ipcRequest.DeviceAddr, ipcRequest.MTU),
 		associate: ep.UDPAssociate,
+		sessions:  sessions,
 		logf:      wireproxyLog,
 	}
 	go runAwgSocks(ln, tnet, udp, newBridgeSocksAuth(ep.Username, ep.Password))
@@ -277,10 +281,22 @@ const (
 	awgNameCacheSize  = 64
 )
 
+// awgMaxDatagram is the largest datagram from the tunnel a session takes
+// whole: four tunnel MTUs, 8 KiB at least — room for a datagram that came in
+// fragments (a large DNS answer), where QUIC, calls and games stay within one.
+// The netstack reassembles up to 64 KiB but cannot say a read was cut short,
+// so a datagram over this is dropped rather than passed on truncated.
+func awgMaxDatagram(mtu int) int {
+	return min(max(8*1024, 4*mtu), 65535)
+}
+
 // newAwgPacketOpener: local are the tunnel's own addresses. The UDP sockets
 // bind to one of them, not to 0.0.0.0 — gvisor takes a bound 0.0.0.0 for an
 // address the interface lacks and finds no route ("network is unreachable").
-func newAwgPacketOpener(tnet *netstack.Net, local []netip.Addr) bridgePacketOpener {
+func newAwgPacketOpener(tnet *netstack.Net, local []netip.Addr, mtu int) bridgePacketOpener {
+	maxDatagram := awgMaxDatagram(mtu)
+	// One byte over the largest datagram: a read that fills it was cut short.
+	buffers := bridgeBuffers(socks5UDPMaxHeader + maxDatagram + 1)
 	var local4, local6 netip.Addr
 	for _, addr := range local {
 		addr = addr.Unmap()
@@ -292,12 +308,14 @@ func newAwgPacketOpener(tnet *netstack.Net, local []netip.Addr) bridgePacketOpen
 	}
 	return func(_ context.Context, handler bridgePacketHandler) (bridgePacketSession, error) {
 		return &awgPacketSession{
-			tnet:    tnet,
-			handler: handler,
-			local4:  local4,
-			local6:  local6,
-			names:   make(map[string]awgName),
-			addrs:   make(map[netip.AddrPort]*net.UDPAddr),
+			tnet:        tnet,
+			handler:     handler,
+			local4:      local4,
+			local6:      local6,
+			buffers:     buffers,
+			maxDatagram: maxDatagram,
+			names:       make(map[string]awgName),
+			addrs:       make(map[netip.AddrPort]*net.UDPAddr),
 		}, nil
 	}
 }
@@ -317,6 +335,9 @@ type awgPacketSession struct {
 	tnet           *netstack.Net
 	handler        bridgePacketHandler
 	local4, local6 netip.Addr
+	buffers        *bridgeBufferPool
+	maxDatagram    int
+	oversized      atomic.Bool // logged once per session
 
 	mu     sync.Mutex
 	closed bool
@@ -435,13 +456,19 @@ func (s *awgPacketSession) socket(v4 bool) (net.PacketConn, error) {
 }
 
 func (s *awgPacketSession) read(c net.PacketConn) {
-	b := getPacketBuffer()
-	defer putPacketBuffer(b)
+	b := s.buffers.get()
+	defer s.buffers.put(b)
 	for {
 		n, addr, err := c.ReadFrom((*b)[socks5UDPMaxHeader:])
 		if err != nil {
 			s.handler.handleEnd(err)
 			return
+		}
+		if n > s.maxDatagram {
+			if !s.oversized.Swap(true) {
+				wireproxyLog("udp: a datagram over %d bytes from %v dropped", s.maxDatagram, addr)
+			}
+			continue
 		}
 		s.handler.handlePacket((*b)[:socks5UDPMaxHeader+n], socks5UDPMaxHeader, M.SocksaddrFromNet(addr).Unwrap())
 	}

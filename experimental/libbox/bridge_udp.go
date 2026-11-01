@@ -51,14 +51,28 @@ import (
 //
 // Upstream is the bridge's own packet path: a Shadowsocks UDP session to the
 // Outline server, or UDP sockets inside the AmneziaWG netstack.
+//
+// What a session holds while it waits is kept small, since sing-box opens one
+// per UDP socket of every app and a TV box has little memory: no buffer for the
+// client's next datagram (it is read into the stream's own small buffer, or one
+// taken from a pool for that datagram alone), an upstream read buffer the size
+// the bridge can deliver (outline-sdk never returns more than 16 KiB; the
+// AmneziaWG netstack, a few tunnel MTUs), and no goroutine of its own for the
+// idle timeout. A bridge serves at most bridgeUDPMaxSessions at once (see
+// bridgeUDPSessions).
 
 const (
 	// socks5UDPMaxHeader is the longest SOCKS5 UDP header: RSV FRAG ATYP, a
-	// 255-byte name and the port. Every packet buffer keeps that much free in
-	// front of the payload so a header can go in without a copy.
+	// 255-byte name and the port. Every upstream read buffer keeps that much
+	// free in front of the payload so a header can go in without a copy.
 	socks5UDPMaxHeader = 3 + 1 + 1 + 255 + 2
-	// bridgePacketBufferSize fits any UDP datagram behind that headroom.
-	bridgePacketBufferSize = socks5UDPMaxHeader + 65535
+	// bridgeAssociateBufferSize fits any datagram a client can send to an
+	// association's relay.
+	bridgeAssociateBufferSize = 65535
+	// uotReaderSize is the stream buffer of a UDP-over-TCP session. A datagram
+	// that fits (QUIC, calls, DNS: all of them in practice) is handed upstream
+	// straight from it; a larger one gets a pooled buffer for itself.
+	uotReaderSize = 4 * 1024
 	// sing-box writes the UDP-over-TCP request together with the first
 	// datagram, which is there as soon as the session exists.
 	uotRequestTimeout = 30 * time.Second
@@ -85,13 +99,40 @@ func udpIdleTimeout() time.Duration {
 // have 127.0.0.1, where the relay keeps the listener's address.
 var bridgeRelayRandomLoopback = runtime.GOOS == "linux" || runtime.GOOS == "android"
 
-var bridgePacketBufferPool = sync.Pool{New: func() any {
-	b := make([]byte, bridgePacketBufferSize)
-	return &b
-}}
+// bridgeBufferPool hands out buffers of one size.
+type bridgeBufferPool struct {
+	size int
+	pool sync.Pool
+}
 
-func getPacketBuffer() *[]byte  { return bridgePacketBufferPool.Get().(*[]byte) }
-func putPacketBuffer(b *[]byte) { bridgePacketBufferPool.Put(b) }
+func newBridgeBufferPool(size int) *bridgeBufferPool {
+	p := &bridgeBufferPool{size: size}
+	p.pool.New = func() any {
+		b := make([]byte, size)
+		return &b
+	}
+	return p
+}
+
+func (p *bridgeBufferPool) get() *[]byte  { return p.pool.Get().(*[]byte) }
+func (p *bridgeBufferPool) put(b *[]byte) { p.pool.Put(b) }
+
+var (
+	bridgeBufferPoolsMu sync.Mutex
+	bridgeBufferPools   = make(map[int]*bridgeBufferPool)
+)
+
+// bridgeBuffers returns the shared pool for buffers of size bytes.
+func bridgeBuffers(size int) *bridgeBufferPool {
+	bridgeBufferPoolsMu.Lock()
+	defer bridgeBufferPoolsMu.Unlock()
+	pool := bridgeBufferPools[size]
+	if pool == nil {
+		pool = newBridgeBufferPool(size)
+		bridgeBufferPools[size] = pool
+	}
+	return pool
+}
 
 var (
 	errSocks5UDPShort    = errors.New("socks5 udp: short datagram")
@@ -247,13 +288,15 @@ type bridgePacketOpener func(ctx context.Context, handler bridgePacketHandler) (
 // bridgePacketPeer is the client end of a UDP session: the relay socket of an
 // association or the stream of a UDP-over-TCP connection.
 type bridgePacketPeer interface {
-	// readPacket returns the next datagram the client sends and where it goes;
-	// the payload aliases b. An error ends the session.
-	readPacket(b []byte) ([]byte, M.Socksaddr, error)
+	// readPacket returns the next datagram the client sends and where it goes.
+	// The payload stays valid until the next call. An error ends the session.
+	readPacket() ([]byte, M.Socksaddr, error)
 	// writePacket sends b[off:] to the client as coming from src, using b[:off]
 	// for the header. Safe for concurrent use. An error that is not
 	// errPacketDropped ends the session.
 	writePacket(b []byte, off int, src M.Socksaddr) error
+	// release gives back what readPacket holds, once reading is over.
+	release()
 }
 
 // bridgeUDP is how one endpoint of a bridge serves UDP.
@@ -264,7 +307,9 @@ type bridgeUDP struct {
 	// associate lets UDP ASSOCIATE in (the endpoint's udp_associate). UDP over
 	// TCP needs nothing.
 	associate bool
-	logf      func(string, ...any)
+	// sessions is the bridge's cap, shared by all its endpoints.
+	sessions *bridgeUDPSessions
+	logf     func(string, ...any)
 }
 
 // associateAllowed tells socks5Handshake whether UDP ASSOCIATE gets through.
@@ -273,26 +318,28 @@ func (u *bridgeUDP) associateAllowed() bool {
 }
 
 // bridgePacketRelay moves datagrams between a peer and an upstream session
-// until either side ends, the control connection goes, or nothing crosses for
-// bridgeUDPIdleTimeout.
+// until either side ends, the control connection goes, nothing crosses for
+// bridgeUDPIdleTimeout, or the bridge's cap makes room for a newer session.
 type bridgePacketRelay struct {
-	peer    bridgePacketPeer
-	session bridgePacketSession
+	peer     bridgePacketPeer
+	session  bridgePacketSession
+	sessions *bridgeUDPSessions
 
-	closeMu sync.Mutex
-	closers []io.Closer
-	stopped chan struct{}
-	isStop  bool
+	closeMu   sync.Mutex
+	closers   []io.Closer
+	isStop    bool
+	idleTimer *time.Timer
 
 	last    atomic.Int64
 	up      atomic.Int64
 	down    atomic.Int64
 	drops   atomic.Int64
 	idleOut atomic.Bool
+	evicted atomic.Bool
 }
 
-func newBridgePacketRelay(peer bridgePacketPeer, closers ...io.Closer) *bridgePacketRelay {
-	r := &bridgePacketRelay{peer: peer, closers: closers, stopped: make(chan struct{})}
+func newBridgePacketRelay(closers ...io.Closer) *bridgePacketRelay {
+	r := &bridgePacketRelay{closers: closers}
 	r.touch()
 	return r
 }
@@ -321,11 +368,14 @@ func (r *bridgePacketRelay) stop() {
 	r.isStop = true
 	closers := r.closers
 	r.closers = nil
-	close(r.stopped)
+	if r.idleTimer != nil {
+		r.idleTimer.Stop()
+	}
 	r.closeMu.Unlock()
 	for _, c := range closers {
 		_ = c.Close()
 	}
+	r.sessions.leave(r)
 }
 
 func (r *bridgePacketRelay) handlePacket(b []byte, off int, src M.Socksaddr) {
@@ -357,12 +407,13 @@ func (r *bridgePacketRelay) open(opener bridgePacketOpener) error {
 // run carries client datagrams upstream until the session ends, then closes
 // everything. The session's readers deliver the other way on their own.
 func (r *bridgePacketRelay) run() {
-	defer r.stop()
-	go r.watchIdle(udpIdleTimeout())
-	b := getPacketBuffer()
-	defer putPacketBuffer(b)
+	defer func() {
+		r.stop()
+		r.peer.release()
+	}()
+	r.startIdleTimer(udpIdleTimeout())
 	for {
-		payload, dest, err := r.peer.readPacket(*b)
+		payload, dest, err := r.peer.readPacket()
 		if err != nil {
 			return
 		}
@@ -378,27 +429,29 @@ func (r *bridgePacketRelay) run() {
 	}
 }
 
-func (r *bridgePacketRelay) watchIdle(idle time.Duration) {
-	tick := idle / 4
-	if tick < 10*time.Millisecond {
-		tick = 10 * time.Millisecond
-	} else if tick > 30*time.Second {
-		tick = 30 * time.Second
+// startIdleTimer ends the session once nothing has crossed it for idle. A
+// timer rather than a goroutine: a session that waits holds no stack for it.
+func (r *bridgePacketRelay) startIdleTimer(idle time.Duration) {
+	r.closeMu.Lock()
+	defer r.closeMu.Unlock()
+	if r.isStop {
+		return
 	}
-	ticker := time.NewTicker(tick)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-r.stopped:
-			return
-		case <-ticker.C:
-			if time.Since(time.Unix(0, r.last.Load())) >= idle {
-				r.idleOut.Store(true)
-				r.stop()
-				return
-			}
-		}
+	r.idleTimer = time.AfterFunc(idle, func() { r.checkIdle(idle) })
+}
+
+func (r *bridgePacketRelay) checkIdle(idle time.Duration) {
+	remaining := idle - time.Since(time.Unix(0, r.last.Load()))
+	if remaining <= 0 {
+		r.idleOut.Store(true)
+		r.stop()
+		return
 	}
+	r.closeMu.Lock()
+	if !r.isStop {
+		r.idleTimer.Reset(max(remaining, 10*time.Millisecond))
+	}
+	r.closeMu.Unlock()
 }
 
 func (r *bridgePacketRelay) summary() string {
@@ -406,7 +459,142 @@ func (r *bridgePacketRelay) summary() string {
 	if r.idleOut.Load() {
 		s += " (idle)"
 	}
+	if r.evicted.Load() {
+		s += " (closed for a newer session)"
+	}
 	return s
+}
+
+// ---- the cap ----
+
+// bridgeUDPMaxSessions caps the UDP sessions one bridge — all its endpoints
+// together — serves at once. sing-box opens a session for every UDP socket of
+// every app, and its own table keeps up to 16384 of them on any TV box, while
+// each costs the bridge a few dozen KiB and two or three descriptors. At the
+// cap a new session takes the place of the one idle the longest, provided that
+// one has been quiet for bridgeUDPEvictIdle; when every session is busy the new
+// one is refused (SOCKS reply 0x01 to its CONNECT or ASSOCIATE), and its app
+// falls back the way it does on a network that drops UDP.
+const (
+	bridgeUDPMaxSessions = 512
+	bridgeUDPEvictIdle   = 30 * time.Second
+	// bridgeUDPCapReport: at most one line about the cap in this long.
+	bridgeUDPCapReport = 10 * time.Second
+)
+
+// Overrides for tests, when positive.
+var (
+	bridgeUDPMaxOverride   atomic.Int64
+	bridgeUDPEvictOverride atomic.Int64
+)
+
+func udpMaxSessions() int {
+	if n := bridgeUDPMaxOverride.Load(); n > 0 {
+		return int(n)
+	}
+	return bridgeUDPMaxSessions
+}
+
+func udpEvictIdle() time.Duration {
+	if d := bridgeUDPEvictOverride.Load(); d > 0 {
+		return time.Duration(d)
+	}
+	return bridgeUDPEvictIdle
+}
+
+// bridgeUDPSessions counts the open UDP sessions of one bridge. nil counts
+// nothing and refuses nothing.
+type bridgeUDPSessions struct {
+	logf func(string, ...any)
+
+	mu     sync.Mutex
+	active map[*bridgePacketRelay]struct{}
+	// Since the last line in the log.
+	evicted, refused int
+	reported         time.Time
+	pendingReport    *time.Timer
+}
+
+func newBridgeUDPSessions(logf func(string, ...any)) *bridgeUDPSessions {
+	return &bridgeUDPSessions{logf: logf, active: make(map[*bridgePacketRelay]struct{})}
+}
+
+// admit counts r in, making room at the cap; false: r is refused. Either way
+// r leaves again when it stops.
+func (s *bridgeUDPSessions) admit(r *bridgePacketRelay) bool {
+	if s == nil {
+		return true
+	}
+	r.sessions = s
+	limit := udpMaxSessions()
+	s.mu.Lock()
+	if len(s.active) < limit {
+		s.active[r] = struct{}{}
+		s.mu.Unlock()
+		return true
+	}
+	var victim *bridgePacketRelay
+	var victimLast int64
+	for candidate := range s.active {
+		if last := candidate.last.Load(); victim == nil || last < victimLast {
+			victim, victimLast = candidate, last
+		}
+	}
+	admitted := victim != nil && time.Since(time.Unix(0, victimLast)) >= udpEvictIdle()
+	if admitted {
+		delete(s.active, victim)
+		s.active[r] = struct{}{}
+		s.evicted++
+	} else {
+		s.refused++
+	}
+	line := s.reportLocked(limit)
+	s.mu.Unlock()
+	if admitted {
+		victim.evicted.Store(true)
+		victim.stop()
+	}
+	if line != "" {
+		s.logf("%s", line)
+	}
+	return admitted
+}
+
+func (s *bridgeUDPSessions) leave(r *bridgePacketRelay) {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	delete(s.active, r)
+	s.mu.Unlock()
+}
+
+// reportLocked returns the line to log about the cap, or "" when one went out
+// less than bridgeUDPCapReport ago — then a timer reports what piles up meanwhile.
+func (s *bridgeUDPSessions) reportLocked(limit int) string {
+	if wait := bridgeUDPCapReport - time.Since(s.reported); wait > 0 {
+		if s.pendingReport == nil {
+			s.pendingReport = time.AfterFunc(wait, s.flushReport)
+		}
+		return ""
+	}
+	line := fmt.Sprintf("udp: %d sessions at once, the limit of this bridge: closed %d idle for newer ones, refused %d", limit, s.evicted, s.refused)
+	s.evicted, s.refused = 0, 0
+	s.reported = time.Now()
+	return line
+}
+
+func (s *bridgeUDPSessions) flushReport() {
+	s.mu.Lock()
+	s.pendingReport = nil
+	line := ""
+	if s.evicted > 0 || s.refused > 0 {
+		line = s.reportLocked(udpMaxSessions())
+	}
+	s.mu.Unlock()
+	if line != "" {
+		s.logf("%s", line)
+	}
 }
 
 // serveBridgeUDP serves the UDP requests of a bridge's SOCKS client: a UDP
@@ -434,10 +622,17 @@ func serveUDPOverTCP(client net.Conn, request socks5Request, udp *bridgeUDP) {
 		}
 		return
 	}
+	relay := newBridgePacketRelay(client)
+	// Before the reply: a session over the cap is refused on its CONNECT.
+	if !udp.sessions.admit(relay) {
+		_ = writeSocks5Reply(client, socks5ReplyGeneralFailure, netip.AddrPort{})
+		return
+	}
+	defer relay.stop()
 	if err := writeSocks5Reply(client, socks5ReplySucceeded, netip.AddrPort{}); err != nil {
 		return
 	}
-	reader := bufio.NewReaderSize(client, 16*1024)
+	reader := bufio.NewReaderSize(client, uotReaderSize)
 	var uotRequest uot.Request // version 1: no request, every datagram addressed
 	if request.host == uot.MagicAddress {
 		_ = client.SetReadDeadline(time.Now().Add(uotRequestTimeout))
@@ -449,15 +644,13 @@ func serveUDPOverTCP(client net.Conn, request socks5Request, udp *bridgeUDP) {
 		}
 		uotRequest = *parsed
 	}
-	peer := &uotPeer{
+	relay.peer = &uotPeer{
 		reader:      reader,
 		conn:        uot.NewConn(client, uotRequest),
 		isConnect:   uotRequest.IsConnect,
 		destination: uotRequest.Destination.Unwrap(),
 	}
-	relay := newBridgePacketRelay(peer, client)
 	if err := relay.open(udp.open); err != nil {
-		relay.stop()
 		udp.logf("udp-over-tcp: upstream: %v", err)
 		return
 	}
@@ -472,35 +665,51 @@ type uotPeer struct {
 	conn        *uot.Conn // writes only: the reader above owns the read side
 	isConnect   bool
 	destination M.Socksaddr
+	// What the datagram last returned still holds: its bytes in reader, or a
+	// pooled buffer of its own.
+	unread int
+	large  []byte
 }
 
-func (p *uotPeer) readPacket(b []byte) ([]byte, M.Socksaddr, error) {
-	for {
-		dest := p.destination
-		if !p.isConnect {
-			var err error
-			dest, err = uot.AddrParser.ReadAddrPort(p.reader)
-			if err != nil {
-				return nil, M.Socksaddr{}, err
-			}
-			dest = dest.Unwrap()
-		}
-		var size [2]byte
-		if _, err := io.ReadFull(p.reader, size[:]); err != nil {
+func (p *uotPeer) readPacket() ([]byte, M.Socksaddr, error) {
+	p.release()
+	dest := p.destination
+	if !p.isConnect {
+		var err error
+		dest, err = uot.AddrParser.ReadAddrPort(p.reader)
+		if err != nil {
 			return nil, M.Socksaddr{}, err
 		}
-		length := int(binary.BigEndian.Uint16(size[:]))
-		if length > len(b) {
-			// Cannot happen with our buffers; keep the stream in step anyway.
-			if _, err := p.reader.Discard(length); err != nil {
-				return nil, M.Socksaddr{}, err
-			}
-			continue
-		}
-		if _, err := io.ReadFull(p.reader, b[:length]); err != nil {
+		dest = dest.Unwrap()
+	}
+	var size [2]byte
+	if _, err := io.ReadFull(p.reader, size[:]); err != nil {
+		return nil, M.Socksaddr{}, err
+	}
+	length := int(binary.BigEndian.Uint16(size[:]))
+	if length <= p.reader.Size() {
+		payload, err := p.reader.Peek(length)
+		if err != nil {
 			return nil, M.Socksaddr{}, err
 		}
-		return b[:length], dest, nil
+		p.unread = length
+		return payload, dest, nil
+	}
+	p.large = buf.Get(length)
+	if _, err := io.ReadFull(p.reader, p.large); err != nil {
+		return nil, M.Socksaddr{}, err
+	}
+	return p.large, dest, nil
+}
+
+func (p *uotPeer) release() {
+	if p.unread > 0 {
+		_, _ = p.reader.Discard(p.unread)
+		p.unread = 0
+	}
+	if p.large != nil {
+		_ = buf.Put(p.large)
+		p.large = nil
 	}
 }
 
@@ -514,10 +723,19 @@ func (p *uotPeer) writePacket(b []byte, off int, src M.Socksaddr) error {
 
 // ---- UDP ASSOCIATE ----
 
+// bridgeAssociateBuffers holds the read buffers of association relays, which
+// must take any datagram a client can send.
+var bridgeAssociateBuffers = newBridgeBufferPool(bridgeAssociateBufferSize)
+
 func serveUDPAssociate(client net.Conn, request socks5Request, udp *bridgeUDP) {
 	if !udp.associateAllowed() {
 		// socks5Handshake already refuses this; keep the reply right anyway.
 		_ = writeSocks5Reply(client, socks5ReplyNoCommand, netip.AddrPort{})
+		return
+	}
+	relay := newBridgePacketRelay(client)
+	if !udp.sessions.admit(relay) {
+		_ = writeSocks5Reply(client, socks5ReplyGeneralFailure, netip.AddrPort{})
 		return
 	}
 	local := M.AddrPortFromNet(client.LocalAddr())
@@ -525,11 +743,13 @@ func serveUDPAssociate(client net.Conn, request socks5Request, udp *bridgeUDP) {
 	relaySocket, err := listenUDPRelay(local.Addr())
 	if err != nil {
 		_ = writeSocks5Reply(client, socks5ReplyGeneralFailure, netip.AddrPort{})
+		relay.stop()
 		udp.logf("udp associate: relay: %v", err)
 		return
 	}
+	relay.addCloser(relaySocket)
 	peer := newUDPAssociatePeer(relaySocket, remote.Addr(), request.addr())
-	relay := newBridgePacketRelay(peer, client, relaySocket)
+	relay.peer = peer
 	if err := relay.open(udp.open); err != nil {
 		_ = writeSocks5Reply(client, socks5ReplyGeneralFailure, netip.AddrPort{})
 		relay.stop()
@@ -588,6 +808,8 @@ type udpAssociatePeer struct {
 	client    atomic.Pointer[netip.AddrPort]
 	foreign   atomic.Int64
 	malformed atomic.Int64
+	// buffer is what readPacket reads into, from bridgeAssociateBuffers.
+	buffer *[]byte
 }
 
 // newUDPAssociatePeer: requested is DST.ADDR/DST.PORT of the request, the
@@ -622,7 +844,11 @@ func (p *udpAssociatePeer) acceptable(src netip.AddrPort) bool {
 	return src.Addr() == p.controlIP
 }
 
-func (p *udpAssociatePeer) readPacket(b []byte) ([]byte, M.Socksaddr, error) {
+func (p *udpAssociatePeer) readPacket() ([]byte, M.Socksaddr, error) {
+	if p.buffer == nil {
+		p.buffer = bridgeAssociateBuffers.get()
+	}
+	b := *p.buffer
 	for {
 		n, src, err := p.relay.ReadFromUDPAddrPort(b)
 		if err != nil {
@@ -646,6 +872,13 @@ func (p *udpAssociatePeer) readPacket(b []byte) ([]byte, M.Socksaddr, error) {
 			p.client.Store(&src)
 		}
 		return payload, dest, nil
+	}
+}
+
+func (p *udpAssociatePeer) release() {
+	if p.buffer != nil {
+		bridgeAssociateBuffers.put(p.buffer)
+		p.buffer = nil
 	}
 }
 

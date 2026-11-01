@@ -8,6 +8,7 @@ import (
 	"io"
 	"net"
 	"net/netip"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -260,6 +261,9 @@ func startTestBridgeUDP(t *testing.T, auth *bridgeSocksAuth, udp *bridgeUDP) (M.
 	t.Cleanup(func() { ln.Close() })
 	log := &testLog{}
 	udp.logf = log.logf
+	if udp.sessions != nil {
+		udp.sessions.logf = log.logf
+	}
 	go func() {
 		for {
 			c, err := ln.Accept()
@@ -689,6 +693,61 @@ func waitFor(t *testing.T, condition func() bool, log *testLog) {
 	}
 }
 
+// ---- raw UDP-over-TCP sessions ----
+
+// dialUoTRaw opens an unconnected UDP-over-TCP session (the version 2 request)
+// by hand — greeting, password, CONNECT to the magic name, the request — the
+// way sing-box's socks outbound with udp_over_tcp does, and reports a refused
+// CONNECT as an error.
+func dialUoTRaw(server, dest M.Socksaddr) (*uot.Conn, net.Conn, error) {
+	c, err := net.DialTimeout("tcp", server.String(), 3*time.Second)
+	if err != nil {
+		return nil, nil, err
+	}
+	_ = c.SetDeadline(time.Now().Add(5 * time.Second))
+	hello := append([]byte{0x05, 0x01, 0x02}, userPass("bridge", "pass-1234")...)
+	connect := append([]byte{0x05, 0x01, 0x00, 0x03, byte(len(uot.MagicAddress))}, uot.MagicAddress...)
+	connect = append(connect, 0, 0)
+	if _, err := c.Write(append(hello, connect...)); err != nil {
+		c.Close()
+		return nil, nil, err
+	}
+	reply := make([]byte, 2+2+10)
+	if _, err := io.ReadFull(c, reply); err != nil {
+		c.Close()
+		return nil, nil, err
+	}
+	if reply[2+2+1] != socks5ReplySucceeded {
+		c.Close()
+		return nil, nil, fmt.Errorf("CONNECT refused: % x", reply)
+	}
+	request := uot.Request{Destination: dest}
+	if err := uot.WriteRequest(c, request); err != nil {
+		c.Close()
+		return nil, nil, err
+	}
+	_ = c.SetDeadline(time.Time{})
+	return uot.NewConn(c, request), c, nil
+}
+
+// uotEcho sends payload to dest and expects it back.
+func uotEcho(conn *uot.Conn, dest M.Socksaddr, payload []byte) error {
+	if _, err := conn.WriteTo(payload, dest); err != nil {
+		return err
+	}
+	_ = conn.SetReadDeadline(time.Now().Add(3 * time.Second))
+	defer conn.SetReadDeadline(time.Time{})
+	b := make([]byte, 65536)
+	n, _, err := conn.ReadFrom(b)
+	if err != nil {
+		return err
+	}
+	if !bytes.Equal(b[:n], payload) {
+		return fmt.Errorf("echo of %d bytes differs (%d bytes back)", len(payload), n)
+	}
+	return nil
+}
+
 // ---- UDP ASSOCIATE is off unless asked for ----
 
 // An endpoint that did not ask for UDP ASSOCIATE refuses it with 0x07 — after
@@ -722,5 +781,178 @@ func TestBridgeUDPAssociateOffByDefault(t *testing.T) {
 	roundTrip(t, conn.(packetClient), testDestinations)
 	if n := upstream.count(); n != 1 {
 		t.Fatalf("%d upstream sessions, want the UDP-over-TCP one only", n)
+	}
+}
+
+// ---- the cap on sessions ----
+
+func TestBridgeUDPCapRefusesWhenEverySessionIsBusy(t *testing.T) {
+	bridgeUDPMaxOverride.Store(2)
+	defer bridgeUDPMaxOverride.Store(0)
+	upstream := newEchoUpstream()
+	server, log := startTestBridgeUDP(t, testAuth, &bridgeUDP{open: upstream.open, sessions: newBridgeUDPSessions(nil)})
+	dest := testDestinations[0]
+	var raws []net.Conn
+	defer func() {
+		for _, raw := range raws {
+			raw.Close()
+		}
+	}()
+	for i := 0; i < 2; i++ {
+		conn, raw, err := dialUoTRaw(server, dest)
+		if err != nil {
+			t.Fatalf("session %d: %v", i, err)
+		}
+		raws = append(raws, raw)
+		if err := uotEcho(conn, dest, []byte("busy")); err != nil {
+			t.Fatalf("session %d: %v", i, err)
+		}
+	}
+	if _, raw, err := dialUoTRaw(server, dest); err == nil {
+		raw.Close()
+		t.Fatal("a third session got in while both were busy")
+	} else if !strings.Contains(err.Error(), "CONNECT refused: 05 02 01 00 05 01") {
+		t.Fatalf("third session: %v", err)
+	}
+	waitFor(t, func() bool {
+		return strings.Contains(log.text(), "udp: 2 sessions at once, the limit of this bridge: closed 0 idle for newer ones, refused 1")
+	}, log)
+	if n := upstream.count(); n != 2 {
+		t.Fatalf("%d upstream sessions opened, want 2", n)
+	}
+	// One goes: there is room again.
+	raws[0].Close()
+	upstream.waitClosed(t)
+	waitFor(t, func() bool {
+		conn, raw, err := dialUoTRaw(server, dest)
+		if err != nil {
+			return false
+		}
+		raws = append(raws, raw)
+		return uotEcho(conn, dest, []byte("room")) == nil
+	}, log)
+}
+
+func TestBridgeUDPCapMakesRoomFromTheLongestIdle(t *testing.T) {
+	bridgeUDPMaxOverride.Store(2)
+	bridgeUDPEvictOverride.Store(int64(150 * time.Millisecond))
+	defer bridgeUDPMaxOverride.Store(0)
+	defer bridgeUDPEvictOverride.Store(0)
+	upstream := newEchoUpstream()
+	server, log := startTestBridgeUDP(t, testAuth, &bridgeUDP{open: upstream.open, sessions: newBridgeUDPSessions(nil)})
+	dest := testDestinations[0]
+	idle, idleRaw, err := dialUoTRaw(server, dest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer idleRaw.Close()
+	busy, busyRaw, err := dialUoTRaw(server, dest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer busyRaw.Close()
+	for _, conn := range []*uot.Conn{idle, busy} {
+		if err := uotEcho(conn, dest, []byte("first")); err != nil {
+			t.Fatal(err)
+		}
+	}
+	time.Sleep(200 * time.Millisecond)
+	if err := uotEcho(busy, dest, []byte("still here")); err != nil {
+		t.Fatal(err)
+	}
+	newer, newerRaw, err := dialUoTRaw(server, dest)
+	if err != nil {
+		t.Fatalf("the newer session was refused: %v", err)
+	}
+	defer newerRaw.Close()
+	// The idle one was closed for it; the busy one was not.
+	_ = idleRaw.SetReadDeadline(time.Now().Add(3 * time.Second))
+	if _, err := idleRaw.Read(make([]byte, 1)); err == nil || isTimeout(err) {
+		t.Fatalf("the idle session is still open: %v", err)
+	}
+	for _, conn := range []*uot.Conn{busy, newer} {
+		if err := uotEcho(conn, dest, []byte("after")); err != nil {
+			t.Fatal(err)
+		}
+	}
+	waitFor(t, func() bool {
+		text := log.text()
+		return strings.Contains(text, "closed 1 idle for newer ones, refused 0") && strings.Contains(text, "(closed for a newer session)")
+	}, log)
+}
+
+// ---- what a session holds ----
+
+// Datagrams of any size cross a UDP-over-TCP session intact, whether they fit
+// the stream's own buffer or get one for themselves, in any order.
+func TestBridgeUDPOverTCPDatagramSizes(t *testing.T) {
+	upstream := newEchoUpstream()
+	server, _ := startTestBridge(t, testAuth, upstream.open)
+	uotClient := &uot.Client{Dialer: singClient(server, "bridge", "pass-1234"), Version: uot.Version}
+	conn, err := uotClient.ListenPacket(context.Background(), testDestinations[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	client := conn.(packetClient)
+	for _, size := range []int{1, 0, uotReaderSize - 1, uotReaderSize, uotReaderSize + 1, 9000, 65535, 3, 20000, 1200} {
+		payload := make([]byte, size)
+		for i := range payload {
+			payload[i] = byte(i*7 + size)
+		}
+		dest := testDestinations[size%len(testDestinations)]
+		if _, err := client.WriteTo(payload, dest); err != nil {
+			t.Fatalf("%d bytes: %v", size, err)
+		}
+		buffer := buf.NewSize(65535)
+		_ = client.SetReadDeadline(time.Now().Add(3 * time.Second))
+		src, err := client.ReadPacket(buffer)
+		if err != nil {
+			t.Fatalf("%d bytes: %v", size, err)
+		}
+		if !bytes.Equal(buffer.Bytes(), payload) || src != dest {
+			t.Fatalf("%d bytes to %v: got %d bytes from %v", size, dest, buffer.Len(), src)
+		}
+		buffer.Release()
+	}
+}
+
+// A session that waits holds no goroutine for its idle timeout: with an
+// upstream that has no reader of its own, the connection's goroutine is all a
+// session has.
+func TestBridgeUDPSessionsHoldNoIdleGoroutine(t *testing.T) {
+	upstream := newEchoUpstream()
+	server, _ := startTestBridge(t, testAuth, upstream.open)
+	dest := testDestinations[0]
+	time.Sleep(50 * time.Millisecond)
+	before := runtime.NumGoroutine()
+	const n = 50
+	var raws []net.Conn
+	defer func() {
+		for _, raw := range raws {
+			raw.Close()
+		}
+	}()
+	for i := 0; i < n; i++ {
+		conn, raw, err := dialUoTRaw(server, dest)
+		if err != nil {
+			t.Fatal(err)
+		}
+		raws = append(raws, raw)
+		if err := uotEcho(conn, dest, []byte("hold")); err != nil {
+			t.Fatal(err)
+		}
+	}
+	time.Sleep(100 * time.Millisecond)
+	if delta := runtime.NumGoroutine() - before; delta > n+5 {
+		t.Fatalf("%d goroutines for %d waiting sessions, want about one each", delta, n)
+	}
+}
+
+func TestAwgMaxDatagram(t *testing.T) {
+	for mtu, want := range map[int]int{1420: 8192, 1280: 8192, 0: 8192, 4000: 16000, 20000: 65535} {
+		if got := awgMaxDatagram(mtu); got != want {
+			t.Errorf("MTU %d: %d, want %d", mtu, got, want)
+		}
 	}
 }
