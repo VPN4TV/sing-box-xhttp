@@ -231,6 +231,76 @@ func TestOutlineBridgeUDPThroughShadowsocks(t *testing.T) {
 	}
 }
 
+// startSingBox runs a sing-box instance from a JSON config in this process.
+func startSingBox(t *testing.T, config string) {
+	t.Helper()
+	ctx := baseContext(nil)
+	options, err := parseConfig(ctx, config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(ctx)
+	instance, err := box.New(box.Options{Context: ctx, Options: options})
+	if err != nil {
+		cancel()
+		t.Fatal(err)
+	}
+	if err := instance.Start(); err != nil {
+		cancel()
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		instance.Close()
+		cancel()
+	})
+}
+
+// The whole chain as the apps build it: an app's UDP enters sing-box (here a
+// SOCKS inbound instead of the TUN), the router sends it to the socks
+// outbound the generator writes for an Outline bridge (password,
+// udp_over_tcp, no network limit), and it comes back from the Shadowsocks
+// server's side.
+func TestOutlineBridgeUDPThroughSingBoxOutbound(t *testing.T) {
+	ssPort := startShadowsocksServer(t, "chacha20-ietf-poly1305", "outline-secret")
+	udpEcho := startUDPEcho(t)
+	userInfo := base64.RawURLEncoding.EncodeToString([]byte("chacha20-ietf-poly1305:outline-secret"))
+	bridgePort := freePort(t)
+	config, _ := json.Marshal(outlineConfig{Endpoints: []outlineEndpoint{{
+		URL:      fmt.Sprintf("ss://%s@127.0.0.1:%d/?prefix=%%16%%03%%01#e2e", userInfo, ssPort),
+		Port:     bridgePort,
+		Listen:   "127.0.0.1",
+		Username: "bridge",
+		Password: "pass-1234",
+	}}})
+	if err := StartOutlineBridge(string(config)); err != nil {
+		t.Fatal(err)
+	}
+	defer StopOutlineBridge()
+
+	inboundPort := freeDualPort(t)
+	startSingBox(t, fmt.Sprintf(`{
+		"log": {"level": "error"},
+		"inbounds": [{"type": "socks", "tag": "app-in", "listen": "127.0.0.1", "listen_port": %d}],
+		"outbounds": [{
+			"type": "socks", "tag": "OL", "server": "127.0.0.1", "server_port": %d, "version": "5",
+			"username": "bridge", "password": "pass-1234",
+			"udp_over_tcp": {"enabled": true, "version": 2}
+		}],
+		"route": {"final": "OL"}
+	}`, inboundPort, bridgePort))
+
+	app := singClient(M.ParseSocksaddrHostPort("127.0.0.1", uint16(inboundPort)), "", "")
+	conn, err := app.ListenPacket(context.Background(), udpEcho)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	// With udp_over_tcp the outbound never sends UDP ASSOCIATE: a bridge
+	// without UDP over TCP would have dialled sp.v2.udp-over-tcp.arpa as TCP
+	// and failed here.
+	echoThrough(t, "sing-box outbound", conn.(packetClient), udpEcho, udpEcho)
+}
+
 // ---- AmneziaWG ----
 
 func x25519Pair(t *testing.T) (private, public []byte) {
