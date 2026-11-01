@@ -285,6 +285,14 @@ func TestUTLSFingerprintNames(t *testing.T) {
 		"hellosafari_26_3": utls.HelloSafari_26_3,
 		"edge":             utls.HelloEdge_Auto,
 		"ios":              utls.HelloIOS_Auto,
+		// Xray's pinned names: exactly the hello named, never a substitute.
+		"hellochrome_120":    utls.HelloChrome_120,
+		"HelloChrome_120":    utls.HelloChrome_120,
+		"hellochrome_120_pq": utls.HelloChrome_120_PQ,
+		"hellochrome_131":    utls.HelloChrome_131,
+		"hellofirefox_120":   utls.HelloFirefox_120,
+		"helloios_14":        utls.HelloIOS_14,
+		"hellorandomized":    utls.HelloRandomized,
 	} {
 		id, err := uTLSClientHelloID(name)
 		require.NoError(t, err, name)
@@ -292,4 +300,16 @@ func TestUTLSFingerprintNames(t *testing.T) {
 	}
 	_, err := uTLSClientHelloID("netscape")
 	require.Error(t, err)
+}
+
+// Every Xray name must give a hello the client can build, not just a name it knows.
+func TestUTLSXrayFingerprintsBuild(t *testing.T) {
+	t.Parallel()
+	for name, id := range xrayFingerprints {
+		if id == utls.HelloGolang || id.Client == utls.HelloRandomized.Client {
+			continue // no fixed spec: the default handshake / a random one
+		}
+		_, err := utls.UTLSIdToSpec(id)
+		require.NoError(t, err, name)
+	}
 }
