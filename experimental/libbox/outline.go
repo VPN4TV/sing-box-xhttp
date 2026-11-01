@@ -51,6 +51,9 @@ type outlineEndpoint struct {
 	// bridgeSocksAuth. Empty keeps the historical no-auth inbound.
 	Username string `json:"username,omitempty"`
 	Password string `json:"password,omitempty"`
+	// UDPAssociate lets SOCKS UDP ASSOCIATE in; off, it is refused (0x07).
+	// UDP over TCP, which the apps use, needs nothing.
+	UDPAssociate bool `json:"udp_associate,omitempty"`
 }
 
 // bridgeListenHost is what an endpoint binds when the profile does not say.
@@ -153,7 +156,11 @@ func StartOutlineBridge(configJSON string) error {
 			stopOutlineLocked()
 			return fmt.Errorf("outline: build dialer for endpoint %d: %w", i, err)
 		}
-		packets := newOutlinePacketOpener(providers, ep.URL, i)
+		udp := &bridgeUDP{
+			open:      newOutlinePacketOpener(providers, ep.URL, i),
+			associate: ep.UDPAssociate,
+			logf:      outlineLog,
+		}
 		listenAddr := fmt.Sprintf("%s:%d", endpointListenHost(ep.Listen), ep.Port)
 		ln, err := net.Listen("tcp", listenAddr)
 		if err != nil {
@@ -161,7 +168,7 @@ func StartOutlineBridge(configJSON string) error {
 			return fmt.Errorf("outline: listen %s: %w", listenAddr, err)
 		}
 		outlineListeners = append(outlineListeners, ln)
-		go runOutlineSocks(ln, dialer, packets, newBridgeSocksAuth(ep.Username, ep.Password))
+		go runOutlineSocks(ln, dialer, udp, newBridgeSocksAuth(ep.Username, ep.Password))
 	}
 	return nil
 }
@@ -250,25 +257,25 @@ func stopOutlineLocked() {
 // connection to dialer.DialStream(realDest) where realDest comes from the
 // SOCKS CONNECT request (the outline-sdk dialer already wraps the SS endpoint,
 // so the target address must be the real website, not the SS server itself).
-// UDP requests go to packets (see bridge_udp.go); nil refuses them.
-func runOutlineSocks(ln net.Listener, dialer transport.StreamDialer, packets bridgePacketOpener, auth *bridgeSocksAuth) {
+// UDP requests go to udp (see bridge_udp.go).
+func runOutlineSocks(ln net.Listener, dialer transport.StreamDialer, udp *bridgeUDP, auth *bridgeSocksAuth) {
 	for {
 		client, err := ln.Accept()
 		if err != nil {
 			return // listener closed
 		}
-		go handleOutlineClient(client, dialer, packets, auth)
+		go handleOutlineClient(client, dialer, udp, auth)
 	}
 }
 
-func handleOutlineClient(client net.Conn, dialer transport.StreamDialer, packets bridgePacketOpener, auth *bridgeSocksAuth) {
+func handleOutlineClient(client net.Conn, dialer transport.StreamDialer, udp *bridgeUDP, auth *bridgeSocksAuth) {
 	defer client.Close()
-	request, err := socks5Handshake(client, auth, packets != nil)
+	request, err := socks5Handshake(client, auth, udp.associateAllowed())
 	if err != nil {
 		outlineLog("socks5 handshake failed: %v", err)
 		return
 	}
-	if serveBridgeUDP(client, request, packets, outlineLog) {
+	if serveBridgeUDP(client, request, udp) {
 		return
 	}
 	realDest := request.dest()

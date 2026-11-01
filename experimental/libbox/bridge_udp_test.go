@@ -243,8 +243,15 @@ func (l *testLog) text() string {
 }
 
 // startTestBridge serves the bridge SOCKS handler on 127.0.0.1 with the given
-// packet path; CONNECT to anything else is refused.
+// packet path and UDP ASSOCIATE allowed; CONNECT to anything else is refused.
 func startTestBridge(t *testing.T, auth *bridgeSocksAuth, opener bridgePacketOpener) (M.Socksaddr, *testLog) {
+	t.Helper()
+	return startTestBridgeUDP(t, auth, &bridgeUDP{open: opener, associate: true})
+}
+
+// startTestBridgeUDP is startTestBridge with the UDP side as given; what the
+// bridge logs goes to the returned testLog.
+func startTestBridgeUDP(t *testing.T, auth *bridgeSocksAuth, udp *bridgeUDP) (M.Socksaddr, *testLog) {
 	t.Helper()
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -252,6 +259,7 @@ func startTestBridge(t *testing.T, auth *bridgeSocksAuth, opener bridgePacketOpe
 	}
 	t.Cleanup(func() { ln.Close() })
 	log := &testLog{}
+	udp.logf = log.logf
 	go func() {
 		for {
 			c, err := ln.Accept()
@@ -260,12 +268,12 @@ func startTestBridge(t *testing.T, auth *bridgeSocksAuth, opener bridgePacketOpe
 			}
 			go func() {
 				defer c.Close()
-				request, err := socks5Handshake(c, auth, opener != nil)
+				request, err := socks5Handshake(c, auth, udp.associateAllowed())
 				if err != nil {
 					log.logf("handshake: %v", err)
 					return
 				}
-				if !serveBridgeUDP(c, request, opener, log.logf) {
+				if !serveBridgeUDP(c, request, udp) {
 					_ = writeSocks5Reply(c, socks5ReplyGeneralFailure, netip.AddrPort{})
 				}
 			}()
@@ -678,5 +686,41 @@ func waitFor(t *testing.T, condition func() bool, log *testLog) {
 			t.Fatal("condition not met")
 		}
 		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// ---- UDP ASSOCIATE is off unless asked for ----
+
+// An endpoint that did not ask for UDP ASSOCIATE refuses it with 0x07 — after
+// the password, like everything else — and still serves UDP over TCP.
+func TestBridgeUDPAssociateOffByDefault(t *testing.T) {
+	upstream := newEchoUpstream()
+	server, _ := startTestBridgeUDP(t, testAuth, &bridgeUDP{open: upstream.open})
+	control, err := net.DialTimeout("tcp", server.String(), 2*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer control.Close()
+	_ = control.SetDeadline(time.Now().Add(5 * time.Second))
+	mustWrite(t, control, []byte{0x05, 0x01, 0x02})
+	mustRead(t, control, []byte{0x05, 0x02})
+	mustWrite(t, control, userPass("bridge", "pass-1234"))
+	mustRead(t, control, []byte{0x01, 0x00})
+	mustWrite(t, control, append([]byte{0x05, 0x03, 0x00}, anyAddress...))
+	mustRead(t, control, []byte{0x05, 0x07, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
+
+	if conn, err := singClient(server, "bridge", "pass-1234").ListenPacket(context.Background(), testDestinations[0]); err == nil {
+		conn.Close()
+		t.Fatal("sing-box's client got an association")
+	}
+	uotClient := &uot.Client{Dialer: singClient(server, "bridge", "pass-1234"), Version: uot.Version}
+	conn, err := uotClient.ListenPacket(context.Background(), testDestinations[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	roundTrip(t, conn.(packetClient), testDestinations)
+	if n := upstream.count(); n != 1 {
+		t.Fatalf("%d upstream sessions, want the UDP-over-TCP one only", n)
 	}
 }

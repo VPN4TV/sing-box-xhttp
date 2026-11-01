@@ -34,12 +34,15 @@ import (
 //     authenticated TCP connection. Nothing listens for UDP on the loopback, so
 //     the password covers the datagrams as it covers TCP, and "sing-box reaches
 //     every bridge over TCP only" stays true. This is what the apps' socks
-//     outbounds use (udp_over_tcp).
+//     outbounds use (udp_over_tcp), and it is always on.
 //
-//   - UDP ASSOCIATE (RFC 1928, section 7), for any other SOCKS client. The
-//     relay is a fresh UDP socket on the loopback that lives as long as the
-//     control connection (and no longer than the idle timeout) and takes
-//     datagrams from one source only, since UDP carries no password: the
+//   - UDP ASSOCIATE (RFC 1928, section 7), for any other SOCKS client — off
+//     unless the endpoint asks for it (udp_associate): the apps do not use it,
+//     and its relay is a UDP socket on the loopback, which another app can race
+//     to between the reply and the first datagram (and reach at will where the
+//     inbound has no password, as on the desktop). When on, the relay lives as
+//     long as the control connection (and no longer than the idle timeout) and
+//     takes datagrams from one source only, since UDP carries no password: the
 //     address the request names when it is a concrete loopback one, otherwise
 //     the first loopback source that sends a well-formed datagram. Datagrams
 //     from anywhere else, and fragments, are dropped without a word. On Linux
@@ -253,6 +256,22 @@ type bridgePacketPeer interface {
 	writePacket(b []byte, off int, src M.Socksaddr) error
 }
 
+// bridgeUDP is how one endpoint of a bridge serves UDP.
+type bridgeUDP struct {
+	// open starts an upstream session; nil: the endpoint has no UDP, and both
+	// kinds of request are refused.
+	open bridgePacketOpener
+	// associate lets UDP ASSOCIATE in (the endpoint's udp_associate). UDP over
+	// TCP needs nothing.
+	associate bool
+	logf      func(string, ...any)
+}
+
+// associateAllowed tells socks5Handshake whether UDP ASSOCIATE gets through.
+func (u *bridgeUDP) associateAllowed() bool {
+	return u != nil && u.open != nil && u.associate
+}
+
 // bridgePacketRelay moves datagrams between a peer and an upstream session
 // until either side ends, the control connection goes, or nothing crosses for
 // bridgeUDPIdleTimeout.
@@ -393,13 +412,13 @@ func (r *bridgePacketRelay) summary() string {
 // serveBridgeUDP serves the UDP requests of a bridge's SOCKS client: a UDP
 // ASSOCIATE, or a CONNECT to the UDP-over-TCP names. It returns false for any
 // other request, which the caller serves as plain TCP.
-func serveBridgeUDP(client net.Conn, request socks5Request, opener bridgePacketOpener, logf func(string, ...any)) bool {
+func serveBridgeUDP(client net.Conn, request socks5Request, udp *bridgeUDP) bool {
 	switch {
 	case request.command == socks5CommandUDPAssociate:
-		serveUDPAssociate(client, request, opener, logf)
+		serveUDPAssociate(client, request, udp)
 		return true
 	case request.command == socks5CommandConnect && (request.host == uot.MagicAddress || request.host == uot.LegacyMagicAddress):
-		serveUDPOverTCP(client, request, opener, logf)
+		serveUDPOverTCP(client, request, udp)
 		return true
 	}
 	return false
@@ -407,10 +426,12 @@ func serveBridgeUDP(client net.Conn, request socks5Request, opener bridgePacketO
 
 // ---- UDP over TCP ----
 
-func serveUDPOverTCP(client net.Conn, request socks5Request, opener bridgePacketOpener, logf func(string, ...any)) {
-	if opener == nil {
+func serveUDPOverTCP(client net.Conn, request socks5Request, udp *bridgeUDP) {
+	if udp == nil || udp.open == nil {
 		_ = writeSocks5Reply(client, socks5ReplyGeneralFailure, netip.AddrPort{})
-		logf("udp-over-tcp refused: this bridge has no UDP")
+		if udp != nil {
+			udp.logf("udp-over-tcp refused: this bridge has no UDP")
+		}
 		return
 	}
 	if err := writeSocks5Reply(client, socks5ReplySucceeded, netip.AddrPort{}); err != nil {
@@ -423,7 +444,7 @@ func serveUDPOverTCP(client net.Conn, request socks5Request, opener bridgePacket
 		parsed, err := uot.ReadRequest(reader)
 		_ = client.SetReadDeadline(time.Time{})
 		if err != nil {
-			logf("udp-over-tcp request: %v", err)
+			udp.logf("udp-over-tcp request: %v", err)
 			return
 		}
 		uotRequest = *parsed
@@ -435,13 +456,13 @@ func serveUDPOverTCP(client net.Conn, request socks5Request, opener bridgePacket
 		destination: uotRequest.Destination.Unwrap(),
 	}
 	relay := newBridgePacketRelay(peer, client)
-	if err := relay.open(opener); err != nil {
+	if err := relay.open(udp.open); err != nil {
 		relay.stop()
-		logf("udp-over-tcp: upstream: %v", err)
+		udp.logf("udp-over-tcp: upstream: %v", err)
 		return
 	}
 	relay.run()
-	logf("udp-over-tcp closed: %s", relay.summary())
+	udp.logf("udp-over-tcp closed: %s", relay.summary())
 }
 
 // uotPeer reads the sing-box UDP-over-TCP framing (uot.Conn): [address]
@@ -493,8 +514,8 @@ func (p *uotPeer) writePacket(b []byte, off int, src M.Socksaddr) error {
 
 // ---- UDP ASSOCIATE ----
 
-func serveUDPAssociate(client net.Conn, request socks5Request, opener bridgePacketOpener, logf func(string, ...any)) {
-	if opener == nil {
+func serveUDPAssociate(client net.Conn, request socks5Request, udp *bridgeUDP) {
+	if !udp.associateAllowed() {
 		// socks5Handshake already refuses this; keep the reply right anyway.
 		_ = writeSocks5Reply(client, socks5ReplyNoCommand, netip.AddrPort{})
 		return
@@ -504,15 +525,15 @@ func serveUDPAssociate(client net.Conn, request socks5Request, opener bridgePack
 	relaySocket, err := listenUDPRelay(local.Addr())
 	if err != nil {
 		_ = writeSocks5Reply(client, socks5ReplyGeneralFailure, netip.AddrPort{})
-		logf("udp associate: relay: %v", err)
+		udp.logf("udp associate: relay: %v", err)
 		return
 	}
 	peer := newUDPAssociatePeer(relaySocket, remote.Addr(), request.addr())
 	relay := newBridgePacketRelay(peer, client, relaySocket)
-	if err := relay.open(opener); err != nil {
+	if err := relay.open(udp.open); err != nil {
 		_ = writeSocks5Reply(client, socks5ReplyGeneralFailure, netip.AddrPort{})
 		relay.stop()
-		logf("udp associate: upstream: %v", err)
+		udp.logf("udp associate: upstream: %v", err)
 		return
 	}
 	bound := M.AddrPortFromNet(relaySocket.LocalAddr())
@@ -527,7 +548,7 @@ func serveUDPAssociate(client net.Conn, request socks5Request, opener bridgePack
 		relay.stop()
 	}()
 	relay.run()
-	logf("udp associate closed: %s, foreign=%d malformed=%d", relay.summary(), peer.foreign.Load(), peer.malformed.Load())
+	udp.logf("udp associate closed: %s, foreign=%d malformed=%d", relay.summary(), peer.foreign.Load(), peer.malformed.Load())
 }
 
 // listenUDPRelay opens the relay socket of an association next to the

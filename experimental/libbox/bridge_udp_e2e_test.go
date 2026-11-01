@@ -216,6 +216,8 @@ func TestOutlineBridgeUDPThroughShadowsocks(t *testing.T) {
 				Listen:   "127.0.0.1",
 				Username: "bridge",
 				Password: "pass-1234",
+				// udpSessions opens an association too.
+				UDPAssociate: true,
 			}}})
 			if err := StartOutlineBridge(string(config)); err != nil {
 				t.Fatal(err)
@@ -427,6 +429,8 @@ func TestWireproxyBridgeUDPThroughWireGuard(t *testing.T) {
 		Listen:   "127.0.0.1",
 		Username: "bridge",
 		Password: "pass-1234",
+		// udpSessions opens an association too.
+		UDPAssociate: true,
 	}}})
 	if err := StartWireproxyBridge(string(config)); err != nil {
 		t.Fatal(err)
@@ -455,4 +459,85 @@ func TestWireproxyBridgeUDPThroughWireGuard(t *testing.T) {
 		t.Fatal(err)
 	}
 	echoThrough(t, "udp over tcp after drops", conn, echo, echo)
+}
+
+// ---- what the endpoints serve unless asked ----
+
+// uotRoundTrip opens an unconnected UDP-over-TCP session through the bridge,
+// as the apps' socks outbounds do, and expects one datagram echoed.
+func uotRoundTrip(t *testing.T, server, dest M.Socksaddr) {
+	t.Helper()
+	uotClient := &uot.Client{Dialer: singClient(server, "bridge", "pass-1234"), Version: uot.Version}
+	conn, err := uotClient.ListenPacket(context.Background(), dest)
+	if err != nil {
+		t.Fatalf("udp over tcp: %v", err)
+	}
+	defer conn.Close()
+	echoThrough(t, "udp over tcp", conn.(packetClient), dest, dest)
+}
+
+// associateReply runs the greeting, the password and a UDP ASSOCIATE by hand
+// and returns the reply code.
+func associateReply(t *testing.T, server M.Socksaddr) byte {
+	t.Helper()
+	control, err := net.DialTimeout("tcp", server.String(), 2*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer control.Close()
+	_ = control.SetDeadline(time.Now().Add(5 * time.Second))
+	mustWrite(t, control, []byte{0x05, 0x01, 0x02})
+	mustRead(t, control, []byte{0x05, 0x02})
+	mustWrite(t, control, userPass("bridge", "pass-1234"))
+	mustRead(t, control, []byte{0x01, 0x00})
+	mustWrite(t, control, append([]byte{0x05, 0x03, 0x00}, anyAddress...))
+	reply := make([]byte, 10)
+	if _, err := io.ReadFull(control, reply); err != nil {
+		t.Fatal(err)
+	}
+	return reply[1]
+}
+
+// The real bridges, configured as the apps configure them: UDP ASSOCIATE is
+// refused (0x07), UDP over TCP is served.
+func TestBridgesRefuseUDPAssociateUnlessAsked(t *testing.T) {
+	ssPort := startShadowsocksServer(t, "chacha20-ietf-poly1305", "outline-secret")
+	udpEcho := startUDPEcho(t)
+	userInfo := base64.RawURLEncoding.EncodeToString([]byte("chacha20-ietf-poly1305:outline-secret"))
+	outlinePort := freePort(t)
+	config, _ := json.Marshal(outlineConfig{Endpoints: []outlineEndpoint{{
+		URL:      fmt.Sprintf("ss://%s@127.0.0.1:%d/#plain", userInfo, ssPort),
+		Port:     outlinePort,
+		Listen:   "127.0.0.1",
+		Username: "bridge",
+		Password: "pass-1234",
+	}}})
+	if err := StartOutlineBridge(string(config)); err != nil {
+		t.Fatal(err)
+	}
+	defer StopOutlineBridge()
+	outline := M.ParseSocksaddrHostPort("127.0.0.1", uint16(outlinePort))
+	if reply := associateReply(t, outline); reply != socks5ReplyNoCommand {
+		t.Fatalf("outline: UDP ASSOCIATE answered %#x, want 0x07", reply)
+	}
+	uotRoundTrip(t, outline, udpEcho)
+
+	ini := startWireGuardServer(t)
+	wgPort := freePort(t)
+	config, _ = json.Marshal(wireproxyConfig{Endpoints: []wireproxyEndpoint{{
+		INI:      ini,
+		Port:     wgPort,
+		Listen:   "127.0.0.1",
+		Username: "bridge",
+		Password: "pass-1234",
+	}}})
+	if err := StartWireproxyBridge(string(config)); err != nil {
+		t.Fatal(err)
+	}
+	defer StopWireproxyBridge()
+	wireproxy := M.ParseSocksaddrHostPort("127.0.0.1", uint16(wgPort))
+	if reply := associateReply(t, wireproxy); reply != socks5ReplyNoCommand {
+		t.Fatalf("wireproxy: UDP ASSOCIATE answered %#x, want 0x07", reply)
+	}
+	uotRoundTrip(t, wireproxy, M.ParseSocksaddrHostPort("10.77.0.1", 7))
 }

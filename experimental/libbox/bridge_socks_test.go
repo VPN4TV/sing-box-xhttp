@@ -22,15 +22,16 @@ func startHandshake(t *testing.T, auth *bridgeSocksAuth) (client net.Conn, resul
 	return client, result, dest
 }
 
-// startHandshakeUDP is startHandshake for a bridge that may serve UDP.
-func startHandshakeUDP(t *testing.T, auth *bridgeSocksAuth, udp bool) (client net.Conn, result chan error, requests chan socks5Request) {
+// startHandshakeUDP is startHandshake for a bridge that may let UDP
+// ASSOCIATE in.
+func startHandshakeUDP(t *testing.T, auth *bridgeSocksAuth, associate bool) (client net.Conn, result chan error, requests chan socks5Request) {
 	t.Helper()
 	server, client := net.Pipe()
 	result = make(chan error, 1)
 	requests = make(chan socks5Request, 1)
 	go func() {
 		defer server.Close()
-		r, err := socks5Handshake(server, auth, udp)
+		r, err := socks5Handshake(server, auth, associate)
 		requests <- r
 		result <- err
 	}()
@@ -136,22 +137,22 @@ func greet(t *testing.T, client net.Conn, auth *bridgeSocksAuth) {
 	mustRead(t, client, []byte{0x01, 0x00})
 }
 
-// A bridge without a packet path refuses UDP ASSOCIATE (it used to be misread
-// as CONNECT), and BIND is refused everywhere.
+// UDP ASSOCIATE is refused unless allowed (it used to be misread as CONNECT),
+// and BIND is refused everywhere.
 func TestSocksHandshakeRefusesUnservedCommands(t *testing.T) {
 	cases := []struct {
-		name    string
-		udp     bool
-		command byte
+		name      string
+		associate bool
+		command   byte
 	}{
-		{"associate without udp", false, 0x03},
+		{"associate not allowed", false, 0x03},
 		{"bind", false, 0x02},
-		{"bind with udp", true, 0x02},
+		{"bind with associate allowed", true, 0x02},
 		{"unknown", true, 0x09},
 	}
 	for _, c := range cases {
 		for _, auth := range []*bridgeSocksAuth{nil, newBridgeSocksAuth("u", "p")} {
-			client, result, _ := startHandshakeUDP(t, auth, c.udp)
+			client, result, _ := startHandshakeUDP(t, auth, c.associate)
 			greet(t, client, auth)
 			// Only the header goes out: net.Pipe is synchronous and the bridge
 			// answers after reading it.
@@ -165,9 +166,9 @@ func TestSocksHandshakeRefusesUnservedCommands(t *testing.T) {
 	}
 }
 
-// With a packet path UDP ASSOCIATE gets through the handshake — after the same
-// password check as CONNECT.
-func TestSocksHandshakeAcceptsAssociateWithUDP(t *testing.T) {
+// Allowed, UDP ASSOCIATE gets through the handshake — after the same password
+// check as CONNECT.
+func TestSocksHandshakeAcceptsAssociateWhenAllowed(t *testing.T) {
 	auth := newBridgeSocksAuth("u", "p")
 	client, result, requests := startHandshakeUDP(t, auth, true)
 	greet(t, client, auth)

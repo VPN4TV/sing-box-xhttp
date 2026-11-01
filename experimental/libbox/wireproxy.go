@@ -54,6 +54,9 @@ type wireproxyEndpoint struct {
 	// Optional username/password for the SOCKS5 inbound; see bridgeSocksAuth.
 	Username string `json:"username,omitempty"`
 	Password string `json:"password,omitempty"`
+	// UDPAssociate lets SOCKS UDP ASSOCIATE in; off, it is refused (0x07).
+	// UDP over TCP, which the apps use, needs nothing.
+	UDPAssociate bool `json:"udp_associate,omitempty"`
 }
 
 type awgRunner struct {
@@ -84,7 +87,7 @@ func StartWireproxyBridge(configJSON string) error {
 	}
 
 	for i, ep := range cfg.Endpoints {
-		runner, err := startOneAwgEndpoint(ep.INI, ep.Port, ep.Listen, newBridgeSocksAuth(ep.Username, ep.Password))
+		runner, err := startOneAwgEndpoint(ep)
 		if err != nil {
 			stopWireproxyLocked()
 			return fmt.Errorf("wireproxy: endpoint %d: %w", i, err)
@@ -119,13 +122,13 @@ func stopWireproxyLocked() {
 // amneziawg-go device against a netstack tun, protects its UDP socket,
 // and spawns a SOCKS5 inbound bound to <listen>:port that dials through
 // the netstack.
-func startOneAwgEndpoint(iniText string, port int, listen string, auth *bridgeSocksAuth) (*awgRunner, error) {
+func startOneAwgEndpoint(ep wireproxyEndpoint) (*awgRunner, error) {
 	iniOpt := ini.LoadOptions{
 		Insensitive:            true,
 		AllowShadows:           true,
 		AllowNonUniqueSections: true,
 	}
-	cfg, err := ini.LoadSources(iniOpt, []byte(iniText))
+	cfg, err := ini.LoadSources(iniOpt, []byte(ep.INI))
 	if err != nil {
 		return nil, fmt.Errorf("load INI: %w", err)
 	}
@@ -176,14 +179,19 @@ func startOneAwgEndpoint(iniText string, port int, listen string, auth *bridgeSo
 	// Protect the bound UDP sockets so WG traffic bypasses our own TUN.
 	protectAwgBind(bind)
 
-	listenAddr := fmt.Sprintf("%s:%d", endpointListenHost(listen), port)
+	listenAddr := fmt.Sprintf("%s:%d", endpointListenHost(ep.Listen), ep.Port)
 	ln, err := net.Listen("tcp", listenAddr)
 	if err != nil {
 		dev.Close()
 		return nil, fmt.Errorf("listen %s: %w", listenAddr, err)
 	}
 
-	go runAwgSocks(ln, tnet, ipcRequest.DeviceAddr, auth)
+	udp := &bridgeUDP{
+		open:      newAwgPacketOpener(tnet, ipcRequest.DeviceAddr),
+		associate: ep.UDPAssociate,
+		logf:      wireproxyLog,
+	}
+	go runAwgSocks(ln, tnet, udp, newBridgeSocksAuth(ep.Username, ep.Password))
 
 	return &awgRunner{listener: ln, device: dev}, nil
 }
@@ -225,25 +233,24 @@ func protectAwgBind(bind conn.Bind) {
 // connection through tnet.DialContext, which routes through the userspace
 // AmneziaWG device to the real peer. UDP goes through the same netstack, from
 // the interface addresses (Address = in the INI).
-func runAwgSocks(ln net.Listener, tnet *netstack.Net, local []netip.Addr, auth *bridgeSocksAuth) {
-	packets := newAwgPacketOpener(tnet, local)
+func runAwgSocks(ln net.Listener, tnet *netstack.Net, udp *bridgeUDP, auth *bridgeSocksAuth) {
 	for {
 		client, err := ln.Accept()
 		if err != nil {
 			return
 		}
-		go handleAwgClient(client, tnet, packets, auth)
+		go handleAwgClient(client, tnet, udp, auth)
 	}
 }
 
-func handleAwgClient(client net.Conn, tnet *netstack.Net, packets bridgePacketOpener, auth *bridgeSocksAuth) {
+func handleAwgClient(client net.Conn, tnet *netstack.Net, udp *bridgeUDP, auth *bridgeSocksAuth) {
 	defer client.Close()
-	request, err := socks5Handshake(client, auth, packets != nil)
+	request, err := socks5Handshake(client, auth, udp.associateAllowed())
 	if err != nil {
 		wireproxyLog("socks5 handshake failed: %v", err)
 		return
 	}
-	if serveBridgeUDP(client, request, packets, wireproxyLog) {
+	if serveBridgeUDP(client, request, udp) {
 		return
 	}
 	realDest := request.dest()

@@ -29,8 +29,9 @@ import (
 //
 // UDP reaches the bridges two ways, both only after the same greeting and
 // password check (see bridge_udp.go): sing-box's UDP over TCP inside an
-// ordinary CONNECT, which is what the apps use, and a standard UDP ASSOCIATE
-// whose relay takes datagrams from one source only.
+// ordinary CONNECT, which is what the apps use, and — only where the endpoint
+// asks for it — a standard UDP ASSOCIATE whose relay takes datagrams from one
+// source only.
 
 // bridgeSocksAuth is the optional username/password (RFC 1929) of an inbound.
 type bridgeSocksAuth struct {
@@ -80,12 +81,14 @@ func (r socks5Request) addr() M.Socksaddr {
 }
 
 // socks5Handshake runs the greeting, the optional username/password
-// subnegotiation and reads the request. CONNECT is always served, UDP ASSOCIATE
-// only when udp is set (the bridge has a packet path); BIND never — and
-// neither of the others is misread as CONNECT any more.
+// subnegotiation and reads the request. CONNECT is always served (UDP over TCP
+// is a CONNECT too), UDP ASSOCIATE only when associate is set (the endpoint
+// has a packet path and asked for it, see bridgeUDP.associateAllowed); BIND
+// never — and neither of the others is misread as CONNECT any more. A refused
+// command gets reply 0x07, command not supported.
 //
 // It does not send the success reply — the caller does, once it has dialled.
-func socks5Handshake(c net.Conn, auth *bridgeSocksAuth, udp bool) (socks5Request, error) {
+func socks5Handshake(c net.Conn, auth *bridgeSocksAuth, associate bool) (socks5Request, error) {
 	_ = c.SetDeadline(time.Now().Add(socks5HandshakeTimeout))
 	defer func() { _ = c.SetDeadline(time.Time{}) }()
 
@@ -128,7 +131,7 @@ func socks5Handshake(c net.Conn, auth *bridgeSocksAuth, udp bool) (socks5Request
 		return socks5Request{}, errors.New("not socks5")
 	}
 	request := socks5Request{command: buf[1]}
-	if request.command != socks5CommandConnect && (request.command != socks5CommandUDPAssociate || !udp) {
+	if request.command != socks5CommandConnect && (request.command != socks5CommandUDPAssociate || !associate) {
 		_, _ = c.Write([]byte{socks5Version, socks5ReplyNoCommand, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
 		return socks5Request{}, fmt.Errorf("unsupported command %d", request.command)
 	}
