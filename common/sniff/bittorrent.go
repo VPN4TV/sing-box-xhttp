@@ -16,6 +16,9 @@ const (
 	trackerConnectFlag    = 0
 	trackerProtocolID     = 0x41727101980
 	trackerConnectMinSize = 16
+
+	// utpTypeSyn is ST_SYN, the packet a uTP connection starts with (BEP 29).
+	utpTypeSyn = 4
 )
 
 // BitTorrent detects if the stream is a BitTorrent connection.
@@ -59,9 +62,15 @@ func UTP(_ context.Context, metadata *adapter.InboundContext, packet []byte) err
 		return os.ErrInvalid
 	}
 
+	// VPN4TV: only the first packet of a flow is sniffed, and a uTP connection
+	// starts with ST_SYN, so nothing else is taken for uTP. Taking any type up
+	// to 4 let ST_DATA with version 1 - a first byte of 0x01 - claim a
+	// WireGuard handshake initiation (01 00 00 00 ...) and a RakNet unconnected
+	// ping (Minecraft Bedrock, 01 and a timestamp) as BitTorrent, and a
+	// "torrents go direct" rule sent those flows around the tunnel.
 	version := packet[0] & 0x0F
 	ty := packet[0] >> 4
-	if version != 1 || ty > 4 {
+	if version != 1 || ty != utpTypeSyn {
 		return os.ErrInvalid
 	}
 
