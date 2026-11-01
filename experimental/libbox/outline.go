@@ -12,6 +12,7 @@ import (
 	"sync"
 	"syscall"
 
+	M "github.com/sagernet/sing/common/metadata"
 	"golang.getoutline.org/sdk/transport"
 	"golang.getoutline.org/sdk/x/configurl"
 )
@@ -99,12 +100,16 @@ func OutlineLog() *StringBox {
 // has a Control function that calls platformInterfaceWrapper.AutoDetectInterfaceControl
 // (Android's VpnService.protect) on the raw fd. This bypasses the TUN that
 // sing-box installs — without it outline traffic loops back through the TUN
-// and deadlocks.
+// and deadlocks. The root UDP dialer and listener get the same Control: the
+// Shadowsocks UDP socket to the server would loop through the TUN just the
+// same.
 func newOutlineProviders() *configurl.ProviderContainer {
 	c := &configurl.ProviderContainer{
-		StreamDialers:   configurl.NewExtensibleProvider[transport.StreamDialer](&transport.TCPDialer{Dialer: protectedNetDialer()}),
-		PacketDialers:   configurl.NewExtensibleProvider[transport.PacketDialer](&transport.UDPDialer{}),
-		PacketListeners: configurl.NewExtensibleProvider[transport.PacketListener](&transport.UDPListener{}),
+		StreamDialers: configurl.NewExtensibleProvider[transport.StreamDialer](&transport.TCPDialer{Dialer: protectedNetDialer()}),
+		PacketDialers: configurl.NewExtensibleProvider[transport.PacketDialer](&transport.UDPDialer{Dialer: protectedNetDialer()}),
+		PacketListeners: configurl.NewExtensibleProvider[transport.PacketListener](&transport.UDPListener{
+			ListenConfig: net.ListenConfig{Control: protectedNetDialer().Control},
+		}),
 	}
 	configurl.RegisterDefaultProviders(c)
 	return c
@@ -148,6 +153,7 @@ func StartOutlineBridge(configJSON string) error {
 			stopOutlineLocked()
 			return fmt.Errorf("outline: build dialer for endpoint %d: %w", i, err)
 		}
+		packets := newOutlinePacketOpener(providers, ep.URL, i)
 		listenAddr := fmt.Sprintf("%s:%d", endpointListenHost(ep.Listen), ep.Port)
 		ln, err := net.Listen("tcp", listenAddr)
 		if err != nil {
@@ -155,9 +161,74 @@ func StartOutlineBridge(configJSON string) error {
 			return fmt.Errorf("outline: listen %s: %w", listenAddr, err)
 		}
 		outlineListeners = append(outlineListeners, ln)
-		go runOutlineSocks(ln, dialer, newBridgeSocksAuth(ep.Username, ep.Password))
+		go runOutlineSocks(ln, dialer, packets, newBridgeSocksAuth(ep.Username, ep.Password))
 	}
 	return nil
+}
+
+// newOutlinePacketOpener builds the UDP side of an endpoint: one Shadowsocks
+// UDP session per SOCKS UDP session, to the same server with the same key.
+//
+// The ?prefix= of the key does not apply to UDP. outline-sdk puts it on TCP
+// only — its packet listener leaves it out ("TODO: support UDP prefix" in
+// x/configurl) and so do the Outline apps — and the server never looks at it:
+// a Shadowsocks server takes any salt, the prefix is just the start of the
+// salt chosen to look like something else on the wire. Every UDP datagram is a
+// plain AEAD packet with a fresh random salt, which outline-ss-server (and any
+// other Shadowsocks server) decrypts with the key alone.
+//
+// A key the UDP side cannot be built for keeps its TCP: the endpoint then
+// refuses UDP, as before.
+func newOutlinePacketOpener(providers *configurl.ProviderContainer, url string, index int) bridgePacketOpener {
+	listener, err := providers.NewPacketListener(context.Background(), url)
+	if err != nil {
+		outlineLog("endpoint %d: no UDP: %v", index, err)
+		return nil
+	}
+	return func(ctx context.Context, handler bridgePacketHandler) (bridgePacketSession, error) {
+		conn, err := listener.ListenPacket(ctx)
+		if err != nil {
+			return nil, err
+		}
+		session := &outlinePacketSession{conn: conn}
+		go session.read(handler)
+		return session, nil
+	}
+}
+
+// outlinePacketSession is one Shadowsocks UDP association: a connected UDP
+// socket to the server, every datagram carrying its own target address.
+type outlinePacketSession struct {
+	conn net.PacketConn
+}
+
+// WriteTo hands names to the server as names, like the TCP side does.
+func (s *outlinePacketSession) WriteTo(p []byte, dest M.Socksaddr) error {
+	_, err := s.conn.WriteTo(p, dest)
+	return err
+}
+
+func (s *outlinePacketSession) Close() error { return s.conn.Close() }
+
+func (s *outlinePacketSession) read(handler bridgePacketHandler) {
+	b := getPacketBuffer()
+	defer putPacketBuffer(b)
+	failures := 0
+	for {
+		n, addr, err := s.conn.ReadFrom((*b)[socks5UDPMaxHeader:])
+		if err != nil {
+			// A datagram that does not decrypt (or an ICMP error) costs only
+			// itself; a run of them that never ends means a dead socket.
+			failures++
+			if isFatalPacketError(err) || failures > 1000 {
+				handler.handleEnd(err)
+				return
+			}
+			continue
+		}
+		failures = 0
+		handler.handlePacket((*b)[:socks5UDPMaxHeader+n], socks5UDPMaxHeader, M.SocksaddrFromNet(addr).Unwrap())
+	}
 }
 
 // StopOutlineBridge stops every running outline SOCKS inbound.
@@ -179,21 +250,25 @@ func stopOutlineLocked() {
 // connection to dialer.DialStream(realDest) where realDest comes from the
 // SOCKS CONNECT request (the outline-sdk dialer already wraps the SS endpoint,
 // so the target address must be the real website, not the SS server itself).
-func runOutlineSocks(ln net.Listener, dialer transport.StreamDialer, auth *bridgeSocksAuth) {
+// UDP requests go to packets (see bridge_udp.go); nil refuses them.
+func runOutlineSocks(ln net.Listener, dialer transport.StreamDialer, packets bridgePacketOpener, auth *bridgeSocksAuth) {
 	for {
 		client, err := ln.Accept()
 		if err != nil {
 			return // listener closed
 		}
-		go handleOutlineClient(client, dialer, auth)
+		go handleOutlineClient(client, dialer, packets, auth)
 	}
 }
 
-func handleOutlineClient(client net.Conn, dialer transport.StreamDialer, auth *bridgeSocksAuth) {
+func handleOutlineClient(client net.Conn, dialer transport.StreamDialer, packets bridgePacketOpener, auth *bridgeSocksAuth) {
 	defer client.Close()
-	request, err := socks5Handshake(client, auth, false)
+	request, err := socks5Handshake(client, auth, packets != nil)
 	if err != nil {
 		outlineLog("socks5 handshake failed: %v", err)
+		return
+	}
+	if serveBridgeUDP(client, request, packets, outlineLog) {
 		return
 	}
 	realDest := request.dest()
