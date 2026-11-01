@@ -33,8 +33,11 @@ import (
 // will dial. Passed in as JSON from Kotlin; the fields mirror what we already
 // parse on the client side.
 //
-// Shape: { "endpoints": [ { "url": "ss://...", "port": 30000 }, ... ] }
+// Shape: { "dns": ["9.9.9.9"], "endpoints": [ { "url": "ss://...", "port": 30000 }, ... ] }
 type outlineConfig struct {
+	// DNS servers for the server names of every endpoint that has none of its
+	// own; see bridgeDNSServers. Absent: the system resolver, as before.
+	DNS       bridgeDNSServers  `json:"dns,omitempty"`
 	Endpoints []outlineEndpoint `json:"endpoints"`
 }
 
@@ -51,6 +54,10 @@ type outlineEndpoint struct {
 	// bridgeSocksAuth. Empty keeps the historical no-auth inbound.
 	Username string `json:"username,omitempty"`
 	Password string `json:"password,omitempty"`
+	// DNS servers for this endpoint's server name, instead of the config's.
+	// A dynamic key is no different: the app puts the key it fetched into URL
+	// before the start, and its server name goes the same way.
+	DNS bridgeDNSServers `json:"dns,omitempty"`
 	// UDPAssociate lets SOCKS UDP ASSOCIATE in; off, it is refused (0x07).
 	// UDP over TCP, which the apps use, needs nothing.
 	UDPAssociate bool `json:"udp_associate,omitempty"`
@@ -106,16 +113,51 @@ func OutlineLog() *StringBox {
 // and deadlocks. The root UDP dialer and listener get the same Control: the
 // Shadowsocks UDP socket to the server would loop through the TUN just the
 // same.
-func newOutlineProviders() *configurl.ProviderContainer {
+//
+// With a resolver the root dialers find the server's address through it, for
+// TCP and UDP alike, instead of the system resolver — which on Android asks
+// the DNS of the VPN network, that is our own tunnel (see bridge_dns.go).
+func newOutlineProviders(resolver *bridgeResolver) *configurl.ProviderContainer {
+	var streams transport.StreamDialer = &transport.TCPDialer{Dialer: protectedNetDialer()}
+	var packets transport.PacketDialer = &transport.UDPDialer{Dialer: protectedNetDialer()}
+	if resolver != nil {
+		streams = &outlineStreamDialer{dialer: protectedNetDialer(), resolver: resolver}
+		packets = &outlinePacketDialer{dialer: protectedNetDialer(), resolver: resolver}
+	}
 	c := &configurl.ProviderContainer{
-		StreamDialers: configurl.NewExtensibleProvider[transport.StreamDialer](&transport.TCPDialer{Dialer: protectedNetDialer()}),
-		PacketDialers: configurl.NewExtensibleProvider[transport.PacketDialer](&transport.UDPDialer{Dialer: protectedNetDialer()}),
+		StreamDialers: configurl.NewExtensibleProvider[transport.StreamDialer](streams),
+		PacketDialers: configurl.NewExtensibleProvider[transport.PacketDialer](packets),
 		PacketListeners: configurl.NewExtensibleProvider[transport.PacketListener](&transport.UDPListener{
 			ListenConfig: net.ListenConfig{Control: protectedNetDialer().Control},
 		}),
 	}
 	configurl.RegisterDefaultProviders(c)
 	return c
+}
+
+// outlineStreamDialer is the root TCP dialer of an endpoint with DNS servers.
+type outlineStreamDialer struct {
+	dialer   net.Dialer
+	resolver *bridgeResolver
+}
+
+func (d *outlineStreamDialer) DialStream(ctx context.Context, addr string) (transport.StreamConn, error) {
+	conn, err := d.resolver.dial(ctx, &d.dialer, "tcp", addr)
+	if err != nil {
+		return nil, err
+	}
+	return conn.(*net.TCPConn), nil
+}
+
+// outlinePacketDialer is the root UDP dialer of an endpoint with DNS servers:
+// the Shadowsocks UDP socket of every session to the server.
+type outlinePacketDialer struct {
+	dialer   net.Dialer
+	resolver *bridgeResolver
+}
+
+func (d *outlinePacketDialer) DialPacket(ctx context.Context, addr string) (net.Conn, error) {
+	return d.resolver.dial(ctx, &d.dialer, "udp", addr)
 }
 
 func protectedNetDialer() net.Dialer {
@@ -149,10 +191,14 @@ func StartOutlineBridge(configJSON string) error {
 		return errors.New("outline: no endpoints")
 	}
 
-	providers := newOutlineProviders()
 	// One cap on UDP sessions for the whole bridge.
 	sessions := newBridgeUDPSessions(outlineLog)
 	for i, ep := range cfg.Endpoints {
+		resolver := newBridgeResolver(pickBridgeDNS(ep.DNS, cfg.DNS), outlineLog)
+		if resolver != nil {
+			outlineLog("endpoint %d: server names through DNS %s", i, resolver)
+		}
+		providers := newOutlineProviders(resolver)
 		dialer, err := providers.NewStreamDialer(context.Background(), ep.URL)
 		if err != nil {
 			stopOutlineLocked()

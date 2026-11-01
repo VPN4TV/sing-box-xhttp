@@ -44,6 +44,10 @@ import (
 // string verbatim (we don't try to type-check field-by-field on the Kotlin
 // side — the amneziawg-go parser is the source of truth).
 type wireproxyConfig struct {
+	// DNS servers for the [Peer] Endpoint names of every endpoint that has
+	// none of its own; see bridgeDNSServers. Absent: the system resolver, as
+	// before.
+	DNS       bridgeDNSServers    `json:"dns,omitempty"`
 	Endpoints []wireproxyEndpoint `json:"endpoints"`
 }
 
@@ -55,6 +59,9 @@ type wireproxyEndpoint struct {
 	// Optional username/password for the SOCKS5 inbound; see bridgeSocksAuth.
 	Username string `json:"username,omitempty"`
 	Password string `json:"password,omitempty"`
+	// DNS servers for this endpoint's [Peer] Endpoint names, instead of the
+	// config's. The INI's own DNS = is the DNS inside the tunnel and stays so.
+	DNS bridgeDNSServers `json:"dns,omitempty"`
 	// UDPAssociate lets SOCKS UDP ASSOCIATE in; off, it is refused (0x07).
 	// UDP over TCP, which the apps use, needs nothing.
 	UDPAssociate bool `json:"udp_associate,omitempty"`
@@ -90,7 +97,11 @@ func StartWireproxyBridge(configJSON string) error {
 	// One cap on UDP sessions for the whole bridge.
 	sessions := newBridgeUDPSessions(wireproxyLog)
 	for i, ep := range cfg.Endpoints {
-		runner, err := startOneAwgEndpoint(ep, sessions)
+		resolver := newBridgeResolver(pickBridgeDNS(ep.DNS, cfg.DNS), wireproxyLog)
+		if resolver != nil {
+			wireproxyLog("endpoint %d: peer endpoints through DNS %s", i, resolver)
+		}
+		runner, err := startOneAwgEndpoint(ep, resolver, sessions)
 		if err != nil {
 			stopWireproxyLocked()
 			return fmt.Errorf("wireproxy: endpoint %d: %w", i, err)
@@ -124,8 +135,9 @@ func stopWireproxyLocked() {
 // startOneAwgEndpoint parses one wg-quick INI string, brings up an
 // amneziawg-go device against a netstack tun, protects its UDP socket,
 // and spawns a SOCKS5 inbound bound to <listen>:port that dials through
-// the netstack.
-func startOneAwgEndpoint(ep wireproxyEndpoint, sessions *bridgeUDPSessions) (*awgRunner, error) {
+// the netstack. With a resolver the [Peer] Endpoint names are resolved
+// through it first.
+func startOneAwgEndpoint(ep wireproxyEndpoint, resolver *bridgeResolver, sessions *bridgeUDPSessions) (*awgRunner, error) {
 	iniOpt := ini.LoadOptions{
 		Insensitive:            true,
 		AllowShadows:           true,
@@ -134,6 +146,11 @@ func startOneAwgEndpoint(ep wireproxyEndpoint, sessions *bridgeUDPSessions) (*aw
 	cfg, err := ini.LoadSources(iniOpt, []byte(ep.INI))
 	if err != nil {
 		return nil, fmt.Errorf("load INI: %w", err)
+	}
+	if resolver != nil {
+		if err := resolveAwgEndpoints(cfg, resolver); err != nil {
+			return nil, err
+		}
 	}
 
 	deviceConf := &wireproxy.DeviceConfig{MTU: 1420}
@@ -198,6 +215,40 @@ func startOneAwgEndpoint(ep wireproxyEndpoint, sessions *bridgeUDPSessions) (*aw
 	go runAwgSocks(ln, tnet, udp, newBridgeSocksAuth(ep.Username, ep.Password))
 
 	return &awgRunner{listener: ln, device: dev}, nil
+}
+
+// resolveAwgEndpoints writes the address of every [Peer] Endpoint given by
+// name into the INI, found through the bridge's resolver, so the parser that
+// reads it next (wireproxy.ParsePeers) never asks the system resolver.
+func resolveAwgEndpoints(cfg *ini.File, resolver *bridgeResolver) error {
+	sections, err := cfg.SectionsByName("Peer")
+	if err != nil {
+		return nil // the parser reports it
+	}
+	for _, section := range sections {
+		key, err := section.GetKey("Endpoint")
+		if err != nil {
+			continue
+		}
+		host, port, err := net.SplitHostPort(strings.TrimSpace(key.String()))
+		if err != nil {
+			continue // the parser reports it
+		}
+		if _, err := netip.ParseAddr(host); err == nil {
+			continue
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), bridgeDNSTimeout+time.Second)
+		addrs, err := resolver.lookup(ctx, host)
+		cancel()
+		if err != nil {
+			return fmt.Errorf("resolve peer endpoint %s: %w", host, err)
+		}
+		// IPv4 first, as the system resolver chose.
+		addr := orderAddrs(addrs)[0]
+		key.SetValue(net.JoinHostPort(addr.String(), port))
+		wireproxyLog("peer endpoint %s is %s", host, addr)
+	}
+	return nil
 }
 
 // protectAwgBind grabs the UDP4/UDP6 fds from an amneziawg-go StdNetBind and
