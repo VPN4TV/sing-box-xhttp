@@ -7,14 +7,17 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"net/netip"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/amnezia-vpn/amneziawg-go/v3/conn"
 	"github.com/amnezia-vpn/amneziawg-go/v3/device"
 	"github.com/amnezia-vpn/amneziawg-go/v3/tun/netstack"
 	wireproxy "github.com/artem-russkikh/wireproxy-awg"
 	"github.com/go-ini/ini"
+	M "github.com/sagernet/sing/common/metadata"
 )
 
 // Wireproxy bridge for AmneziaWG subscriptions (1.0 through 3.1; the INI is
@@ -180,7 +183,7 @@ func startOneAwgEndpoint(iniText string, port int, listen string, auth *bridgeSo
 		return nil, fmt.Errorf("listen %s: %w", listenAddr, err)
 	}
 
-	go runAwgSocks(ln, tnet, auth)
+	go runAwgSocks(ln, tnet, ipcRequest.DeviceAddr, auth)
 
 	return &awgRunner{listener: ln, device: dev}, nil
 }
@@ -220,22 +223,27 @@ func protectAwgBind(bind conn.Bind) {
 
 // runAwgSocks accepts SOCKS5 clients on ln and forwards each accepted
 // connection through tnet.DialContext, which routes through the userspace
-// AmneziaWG device to the real peer.
-func runAwgSocks(ln net.Listener, tnet *netstack.Net, auth *bridgeSocksAuth) {
+// AmneziaWG device to the real peer. UDP goes through the same netstack, from
+// the interface addresses (Address = in the INI).
+func runAwgSocks(ln net.Listener, tnet *netstack.Net, local []netip.Addr, auth *bridgeSocksAuth) {
+	packets := newAwgPacketOpener(tnet, local)
 	for {
 		client, err := ln.Accept()
 		if err != nil {
 			return
 		}
-		go handleAwgClient(client, tnet, auth)
+		go handleAwgClient(client, tnet, packets, auth)
 	}
 }
 
-func handleAwgClient(client net.Conn, tnet *netstack.Net, auth *bridgeSocksAuth) {
+func handleAwgClient(client net.Conn, tnet *netstack.Net, packets bridgePacketOpener, auth *bridgeSocksAuth) {
 	defer client.Close()
-	request, err := socks5Handshake(client, auth, false)
+	request, err := socks5Handshake(client, auth, packets != nil)
 	if err != nil {
 		wireproxyLog("socks5 handshake failed: %v", err)
+		return
+	}
+	if serveBridgeUDP(client, request, packets, wireproxyLog) {
 		return
 	}
 	realDest := request.dest()
@@ -251,6 +259,198 @@ func handleAwgClient(client net.Conn, tnet *netstack.Net, auth *bridgeSocksAuth)
 		return
 	}
 	pipe(client, remote)
+}
+
+// awgResolveTimeout bounds a name lookup through the tunnel; awgNegativeTTL is
+// how long a name that did not resolve is not asked again — the lookup blocks
+// the session's datagrams, and an app keeps sending while it waits.
+const (
+	awgResolveTimeout = 5 * time.Second
+	awgNegativeTTL    = 10 * time.Second
+	awgNameCacheSize  = 64
+)
+
+// newAwgPacketOpener: local are the tunnel's own addresses. The UDP sockets
+// bind to one of them, not to 0.0.0.0 — gvisor takes a bound 0.0.0.0 for an
+// address the interface lacks and finds no route ("network is unreachable").
+func newAwgPacketOpener(tnet *netstack.Net, local []netip.Addr) bridgePacketOpener {
+	var local4, local6 netip.Addr
+	for _, addr := range local {
+		addr = addr.Unmap()
+		if addr.Is4() && !local4.IsValid() {
+			local4 = addr
+		} else if addr.Is6() && !local6.IsValid() {
+			local6 = addr
+		}
+	}
+	return func(_ context.Context, handler bridgePacketHandler) (bridgePacketSession, error) {
+		return &awgPacketSession{
+			tnet:    tnet,
+			handler: handler,
+			local4:  local4,
+			local6:  local6,
+			names:   make(map[string]awgName),
+			addrs:   make(map[netip.AddrPort]*net.UDPAddr),
+		}, nil
+	}
+}
+
+type awgName struct {
+	addr  netip.Addr
+	err   error
+	until time.Time
+}
+
+// awgPacketSession is one SOCKS UDP session inside the AmneziaWG netstack: an
+// unconnected UDP socket per address family, opened with the first datagram
+// of that family, so replies come back from any address the way they would
+// through a NAT. Names are resolved by the tunnel's DNS (the INI's DNS =),
+// exactly as tnet.DialContext does for TCP.
+type awgPacketSession struct {
+	tnet           *netstack.Net
+	handler        bridgePacketHandler
+	local4, local6 netip.Addr
+
+	mu     sync.Mutex
+	closed bool
+	v4, v6 net.PacketConn // *gonet.UDPConn
+
+	// Touched by WriteTo only, which runs on one goroutine.
+	names map[string]awgName
+	addrs map[netip.AddrPort]*net.UDPAddr
+}
+
+func (s *awgPacketSession) WriteTo(p []byte, dest M.Socksaddr) error {
+	addr, err := s.resolve(dest)
+	if err != nil {
+		return err
+	}
+	c, err := s.socket(addr.Addr().Is4())
+	if err != nil {
+		return err
+	}
+	_, err = c.WriteTo(p, s.udpAddr(addr))
+	return err
+}
+
+func (s *awgPacketSession) resolve(dest M.Socksaddr) (netip.AddrPort, error) {
+	dest = dest.Unwrap()
+	if dest.IsIP() {
+		return dest.AddrPort(), nil
+	}
+	if !dest.IsDomain() {
+		return netip.AddrPort{}, errSocks5UDPAddress
+	}
+	now := time.Now()
+	if name, ok := s.names[dest.Fqdn]; ok && (name.err == nil || now.Before(name.until)) {
+		if name.err != nil {
+			return netip.AddrPort{}, name.err
+		}
+		return netip.AddrPortFrom(name.addr, dest.Port), nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), awgResolveTimeout)
+	defer cancel()
+	var name awgName
+	answers, err := s.tnet.LookupContextHost(ctx, dest.Fqdn)
+	if err != nil {
+		name.err = err
+	} else if name.addr = pickAwgAddr(answers); !name.addr.IsValid() {
+		name.err = fmt.Errorf("no address for %s", dest.Fqdn)
+	}
+	name.until = now.Add(awgNegativeTTL)
+	if len(s.names) >= awgNameCacheSize {
+		clear(s.names)
+	}
+	s.names[dest.Fqdn] = name
+	if name.err != nil {
+		wireproxyLog("udp: resolve %s: %v", dest.Fqdn, name.err)
+		return netip.AddrPort{}, name.err
+	}
+	return netip.AddrPortFrom(name.addr, dest.Port), nil
+}
+
+// pickAwgAddr prefers IPv4: there is no trying an address with UDP, and most
+// AmneziaWG tunnels carry IPv4 only.
+func pickAwgAddr(answers []string) netip.Addr {
+	var v6 netip.Addr
+	for _, answer := range answers {
+		addr, err := netip.ParseAddr(answer)
+		if err != nil {
+			continue
+		}
+		addr = addr.Unmap()
+		if addr.Is4() {
+			return addr
+		}
+		if !v6.IsValid() {
+			v6 = addr
+		}
+	}
+	return v6
+}
+
+func (s *awgPacketSession) udpAddr(addr netip.AddrPort) *net.UDPAddr {
+	if cached, ok := s.addrs[addr]; ok {
+		return cached
+	}
+	if len(s.addrs) >= awgNameCacheSize {
+		clear(s.addrs)
+	}
+	// gonet takes the IP bytes as they are: 4 for IPv4, 16 for IPv6.
+	udpAddr := &net.UDPAddr{IP: addr.Addr().AsSlice(), Port: int(addr.Port())}
+	s.addrs[addr] = udpAddr
+	return udpAddr
+}
+
+func (s *awgPacketSession) socket(v4 bool) (net.PacketConn, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed {
+		return nil, net.ErrClosed
+	}
+	slot, local := &s.v6, s.local6
+	if v4 {
+		slot, local = &s.v4, s.local4
+	}
+	if *slot != nil {
+		return *slot, nil
+	}
+	if !local.IsValid() {
+		return nil, errors.New("the tunnel has no address of this family")
+	}
+	c, err := s.tnet.ListenUDPAddrPort(netip.AddrPortFrom(local, 0))
+	if err != nil {
+		return nil, err
+	}
+	*slot = c
+	go s.read(c)
+	return c, nil
+}
+
+func (s *awgPacketSession) read(c net.PacketConn) {
+	b := getPacketBuffer()
+	defer putPacketBuffer(b)
+	for {
+		n, addr, err := c.ReadFrom((*b)[socks5UDPMaxHeader:])
+		if err != nil {
+			s.handler.handleEnd(err)
+			return
+		}
+		s.handler.handlePacket((*b)[:socks5UDPMaxHeader+n], socks5UDPMaxHeader, M.SocksaddrFromNet(addr).Unwrap())
+	}
+}
+
+func (s *awgPacketSession) Close() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.closed = true
+	if s.v4 != nil {
+		_ = s.v4.Close()
+	}
+	if s.v6 != nil {
+		_ = s.v6.Close()
+	}
+	return nil
 }
 
 // wireproxyLog pushes one line into the shared bridge log ring buffer, same
