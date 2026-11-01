@@ -233,11 +233,12 @@ func runAwgSocks(ln net.Listener, tnet *netstack.Net, auth *bridgeSocksAuth) {
 
 func handleAwgClient(client net.Conn, tnet *netstack.Net, auth *bridgeSocksAuth) {
 	defer client.Close()
-	realDest, err := socks5Handshake(client, auth)
+	request, err := socks5Handshake(client, auth, false)
 	if err != nil {
 		wireproxyLog("socks5 handshake failed: %v", err)
 		return
 	}
+	realDest := request.dest()
 	wireproxyLog("dialing %s via awg netstack", realDest)
 	remote, err := tnet.DialContext(context.Background(), "tcp", realDest)
 	if err != nil {

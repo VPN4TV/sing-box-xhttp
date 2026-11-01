@@ -10,21 +10,32 @@ import (
 	"time"
 )
 
-// handshakeResult runs socks5Handshake on one end of a pipe while the test
-// plays the client on the other.
+// startHandshake runs socks5Handshake on one end of a pipe while the test
+// plays the client on the other. The bridge behind it carries TCP only.
 func startHandshake(t *testing.T, auth *bridgeSocksAuth) (client net.Conn, result chan error, dest chan string) {
+	t.Helper()
+	client, result, requests := startHandshakeUDP(t, auth, false)
+	dest = make(chan string, 1)
+	go func() {
+		dest <- (<-requests).dest()
+	}()
+	return client, result, dest
+}
+
+// startHandshakeUDP is startHandshake for a bridge that may serve UDP.
+func startHandshakeUDP(t *testing.T, auth *bridgeSocksAuth, udp bool) (client net.Conn, result chan error, requests chan socks5Request) {
 	t.Helper()
 	server, client := net.Pipe()
 	result = make(chan error, 1)
-	dest = make(chan string, 1)
+	requests = make(chan socks5Request, 1)
 	go func() {
 		defer server.Close()
-		d, err := socks5Handshake(server, auth)
-		dest <- d
+		r, err := socks5Handshake(server, auth, udp)
+		requests <- r
 		result <- err
 	}()
 	_ = client.SetDeadline(time.Now().Add(5 * time.Second))
-	return client, result, dest
+	return client, result, requests
 }
 
 func mustWrite(t *testing.T, c net.Conn, b []byte) {
@@ -110,26 +121,70 @@ func TestSocksHandshakeAcceptsRightPassword(t *testing.T) {
 	}
 }
 
-func TestSocksHandshakeServesConnectOnly(t *testing.T) {
-	for _, auth := range []*bridgeSocksAuth{nil, newBridgeSocksAuth("u", "p")} {
-		client, result, _ := startHandshake(t, auth)
-		if auth == nil {
-			mustWrite(t, client, []byte{0x05, 0x01, 0x00})
-			mustRead(t, client, []byte{0x05, 0x00})
-		} else {
-			mustWrite(t, client, []byte{0x05, 0x01, 0x02})
-			mustRead(t, client, []byte{0x05, 0x02})
-			mustWrite(t, client, userPass("u", "p"))
-			mustRead(t, client, []byte{0x01, 0x00})
+// greet runs the greeting (and the password exchange when auth is set) as the
+// client on a pipe started by startHandshake*.
+func greet(t *testing.T, client net.Conn, auth *bridgeSocksAuth) {
+	t.Helper()
+	if auth == nil {
+		mustWrite(t, client, []byte{0x05, 0x01, 0x00})
+		mustRead(t, client, []byte{0x05, 0x00})
+		return
+	}
+	mustWrite(t, client, []byte{0x05, 0x01, 0x02})
+	mustRead(t, client, []byte{0x05, 0x02})
+	mustWrite(t, client, userPass(string(auth.username), string(auth.password)))
+	mustRead(t, client, []byte{0x01, 0x00})
+}
+
+// A bridge without a packet path refuses UDP ASSOCIATE (it used to be misread
+// as CONNECT), and BIND is refused everywhere.
+func TestSocksHandshakeRefusesUnservedCommands(t *testing.T) {
+	cases := []struct {
+		name    string
+		udp     bool
+		command byte
+	}{
+		{"associate without udp", false, 0x03},
+		{"bind", false, 0x02},
+		{"bind with udp", true, 0x02},
+		{"unknown", true, 0x09},
+	}
+	for _, c := range cases {
+		for _, auth := range []*bridgeSocksAuth{nil, newBridgeSocksAuth("u", "p")} {
+			client, result, _ := startHandshakeUDP(t, auth, c.udp)
+			greet(t, client, auth)
+			// Only the header goes out: net.Pipe is synchronous and the bridge
+			// answers after reading it.
+			mustWrite(t, client, []byte{0x05, c.command, 0x00, 0x01})
+			mustRead(t, client, []byte{0x05, 0x07, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
+			if err := <-result; err == nil {
+				t.Fatalf("%s: command %d accepted", c.name, c.command)
+			}
+			client.Close()
 		}
-		// UDP ASSOCIATE used to be misread as CONNECT. Only the header goes
-		// out: net.Pipe is synchronous and the bridge answers after reading it.
-		mustWrite(t, client, []byte{0x05, 0x03, 0x00, 0x01})
-		mustRead(t, client, []byte{0x05, 0x07, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
-		if err := <-result; err == nil {
-			t.Fatal("UDP ASSOCIATE accepted")
-		}
-		client.Close()
+	}
+}
+
+// With a packet path UDP ASSOCIATE gets through the handshake — after the same
+// password check as CONNECT.
+func TestSocksHandshakeAcceptsAssociateWithUDP(t *testing.T) {
+	auth := newBridgeSocksAuth("u", "p")
+	client, result, requests := startHandshakeUDP(t, auth, true)
+	greet(t, client, auth)
+	mustWrite(t, client, []byte{0x05, 0x03, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
+	if err := <-result; err != nil {
+		t.Fatal(err)
+	}
+	request := <-requests
+	if request.command != socks5CommandUDPAssociate || request.dest() != "0.0.0.0:0" {
+		t.Fatalf("request %+v", request)
+	}
+
+	client, result, _ = startHandshakeUDP(t, auth, true)
+	mustWrite(t, client, []byte{0x05, 0x01, 0x00})
+	mustRead(t, client, []byte{0x05, 0xFF})
+	if err := <-result; err == nil {
+		t.Fatal("a client without the password got to the request")
 	}
 }
 

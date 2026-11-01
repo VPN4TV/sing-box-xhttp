@@ -191,11 +191,12 @@ func runOutlineSocks(ln net.Listener, dialer transport.StreamDialer, auth *bridg
 
 func handleOutlineClient(client net.Conn, dialer transport.StreamDialer, auth *bridgeSocksAuth) {
 	defer client.Close()
-	realDest, err := socks5Handshake(client, auth)
+	request, err := socks5Handshake(client, auth, false)
 	if err != nil {
 		outlineLog("socks5 handshake failed: %v", err)
 		return
 	}
+	realDest := request.dest()
 	outlineLog("socks handshake ok, dialing real dest %s via outline-sdk", realDest)
 	// NOTE: don't use context.WithTimeout here — outline-sdk's StreamDialer
 	// keeps the dial ctx alive for the whole connection lifetime. If we cancel
