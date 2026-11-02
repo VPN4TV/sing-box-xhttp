@@ -190,8 +190,10 @@ func buildAndroid() {
 	if debugEnabled {
 		mainTags = append(mainTags, debugTags...)
 	}
-	// VPN4TV: the 64-bit ABIs get olcrtc, the 32-bit ones (TV boxes, where the
-	// library size is what hurts) do not. gomobile builds one feature set per
+	// VPN4TV: olcrtc is left out of every Android ABI (owner, 2026-11-02: no keys
+	// are issued for it, and it is size and risk for nothing); the with_olcrtc
+	// tag stays available for a build that wants it back. Earlier the 64-bit ABIs
+	// got olcrtc and the 32-bit ones (TV boxes, where the library size hurts) not. gomobile builds one feature set per
 	// invocation, so the two halves are built separately and the 32-bit
 	// libbox.so is then packed into the 64-bit AAR. The Java surface is the
 	// same in both — the small build keeps every export and refuses at runtime.
@@ -199,7 +201,7 @@ func buildAndroid() {
 	if len(wide) == 0 || len(narrow) == 0 {
 		tags := mainTags
 		if len(wide) > 0 {
-			tags = append(append([]string{}, mainTags...), "with_olcrtc")
+			tags = append([]string{}, mainTags...)
 		}
 		buildAndroidVariant(AndroidBuildConfig{
 			AndroidAPI: 23,
@@ -210,7 +212,7 @@ func buildAndroid() {
 		buildAndroidVariant(AndroidBuildConfig{
 			AndroidAPI: 23,
 			OutputName: "libbox.aar",
-			Tags:       append(append([]string{}, mainTags...), "with_olcrtc"),
+			Tags:       append([]string{}, mainTags...),
 		}, strings.Join(wide, ","))
 		buildAndroidVariant(AndroidBuildConfig{
 			AndroidAPI: 23,
