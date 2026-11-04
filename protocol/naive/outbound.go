@@ -7,6 +7,8 @@ import (
 	"encoding/pem"
 	"net"
 	"strings"
+	"sync"
+	"sync/atomic"
 
 	"github.com/sagernet/cronet-go"
 	_ "github.com/sagernet/cronet-go/all"
@@ -39,6 +41,13 @@ type Outbound struct {
 	logger    logger.ContextLogger
 	client    *cronet.NaiveClient
 	uotClient *uot.Client
+	// VPN4TV: on iOS/tvOS the Cronet engine starts at the first connection
+	// (ensureStarted), not with the service: each naive outbound has its own,
+	// and in the 50 MiB Network Extension an engine per outbound of a
+	// subscription costs before anything goes through it.
+	startOnce sync.Once
+	startErr  error
+	started   atomic.Bool
 }
 
 func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, options option.NaiveOutboundOptions) (adapter.Outbound, error) {
@@ -223,15 +232,42 @@ func (h *Outbound) Start(stage adapter.StartStage) error {
 	if stage != adapter.StartStateStart {
 		return nil
 	}
+	if C.IsIos {
+		return nil // VPN4TV: at the first connection, see ensureStarted
+	}
+	return h.startClient()
+}
+
+func (h *Outbound) startClient() error {
 	err := h.client.Start()
 	if err != nil {
 		return err
 	}
+	h.started.Store(true)
 	h.logger.Info("NaiveProxy started, version: ", h.client.Engine().Version())
 	return nil
 }
 
+// VPN4TV: on iOS/tvOS, the engine's start, once: every connection after a
+// failed start gets that error, as a failed start of the service would have
+// stopped them all. Elsewhere Start has done it.
+func (h *Outbound) ensureStarted() error {
+	if !C.IsIos {
+		return nil
+	}
+	h.startOnce.Do(func() {
+		h.startErr = h.startClient()
+		if h.startErr != nil {
+			h.logger.Error("start NaiveProxy: ", h.startErr)
+		}
+	})
+	return h.startErr
+}
+
 func (h *Outbound) DialContext(ctx context.Context, network string, destination M.Socksaddr) (net.Conn, error) {
+	if err := h.ensureStarted(); err != nil {
+		return nil, err
+	}
 	switch N.NetworkName(network) {
 	case N.NetworkTCP:
 		h.logger.InfoContext(ctx, "outbound connection to ", destination)
@@ -251,10 +287,17 @@ func (h *Outbound) ListenPacket(ctx context.Context, destination M.Socksaddr) (n
 	if h.uotClient == nil {
 		return nil, E.New("UDP is not supported unless UDP over TCP is enabled")
 	}
+	if err := h.ensureStarted(); err != nil {
+		return nil, err
+	}
 	return h.uotClient.ListenPacket(ctx, destination)
 }
 
 func (h *Outbound) InterfaceUpdated() {
+	// VPN4TV: an engine not started yet (iOS/tvOS) has nothing to close.
+	if C.IsIos && !h.started.Load() {
+		return
+	}
 	h.client.Engine().CloseAllConnections()
 }
 
