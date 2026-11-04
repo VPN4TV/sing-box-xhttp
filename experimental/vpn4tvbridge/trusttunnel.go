@@ -280,9 +280,11 @@ func (l *DeepLink) ClientTOML(listen string, port int) string {
 	if l.CustomSNI != "" {
 		fmt.Fprintf(&b, "custom_sni = %s\n", tomlString(l.CustomSNI))
 	}
-	if len(l.DNSUpstreams) > 0 {
-		fmt.Fprintf(&b, "dns_upstreams = %s\n", tomlStrings(l.DNSUpstreams))
-	}
+	// dns_upstreams stays out, as on Android: with it the client raises its own
+	// DNS proxy, a listener on the loopback with no password that resolves
+	// through the tunnel, so any process on the machine could learn the
+	// server's exit address from it. sing-box does the DNS anyway, and a name
+	// in a CONNECT is resolved by the TrustTunnel endpoint.
 	fmt.Fprintf(&b, "\n[listener.socks]\naddress = %s\n", tomlString(fmt.Sprintf("%s:%d", listen, port)))
 	return b.String()
 }

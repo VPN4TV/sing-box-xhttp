@@ -29,6 +29,12 @@ func TestDecodeDeepLink(t *testing.T) {
 			t.Errorf("TOML lacks %q:\n%s", want, toml)
 		}
 	}
+	// A link that names DNS upstreams does not get the client's own DNS proxy,
+	// a password-less loopback listener that resolves through the tunnel.
+	link.DNSUpstreams = []string{"8.8.8.8", "tls://1.1.1.1"}
+	if toml := link.ClientTOML("127.0.0.1", 46890); strings.Contains(toml, "dns_upstreams") {
+		t.Errorf("TOML has dns_upstreams:\n%s", toml)
+	}
 	// The same link without the '?' is the older spelling.
 	if _, err := DecodeDeepLink("tt://" + strings.TrimPrefix(testDeepLink, "tt://?")); err != nil {
 		t.Errorf("old spelling rejected: %v", err)
