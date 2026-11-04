@@ -9,11 +9,13 @@ static dispatch_source_t memoryPressureSource;
 
 extern void goMemoryPressureCallback(unsigned long status);
 
+// VPN4TV: WARN too, not only CRITICAL: the warning is what comes while the
+// extension nears its own limit, CRITICAL only with the whole system short.
 static void startMemoryPressureMonitor() {
 	memoryPressureSource = dispatch_source_create(
 		DISPATCH_SOURCE_TYPE_MEMORYPRESSURE,
 		0,
-		DISPATCH_MEMORYPRESSURE_CRITICAL,
+		DISPATCH_MEMORYPRESSURE_WARN | DISPATCH_MEMORYPRESSURE_CRITICAL,
 		dispatch_get_global_queue(QOS_CLASS_DEFAULT, 0)
 	);
 	dispatch_source_set_event_handler(memoryPressureSource, ^{
@@ -21,6 +23,10 @@ static void startMemoryPressureMonitor() {
 		goMemoryPressureCallback(status);
 	});
 	dispatch_activate(memoryPressureSource);
+}
+
+static int isCriticalMemoryPressure(unsigned long status) {
+	return (status & DISPATCH_MEMORYPRESSURE_CRITICAL) != 0;
 }
 
 static void stopMemoryPressureMonitor() {
@@ -54,7 +60,10 @@ func (s *Service) Start(stage adapter.StartStage) error {
 		return nil
 	}
 	if s.timerConfig.policyMode == policyModeNetworkExtension {
-		s.adaptiveTimer = newAdaptiveTimer(s.logger, s.network, s.timerConfig, nil)
+		// VPN4TV: polled from the start (every 10 s while normal, 1 s armed),
+		// not only after the system's pressure event, which may never come
+		// before jetsam; a trigger also leaves the OOM draft (hourly at most).
+		s.adaptiveTimer = newAdaptiveTimer(s.logger, s.network, s.timerConfig, s.writeOOMDraft)
 		globalAccess.Lock()
 		isFirst := len(globalServices) == 0
 		globalServices = append(globalServices, s)
@@ -62,6 +71,7 @@ func (s *Service) Start(stage adapter.StartStage) error {
 		if isFirst {
 			C.startMemoryPressureMonitor()
 		}
+		s.adaptiveTimer.start()
 		return nil
 	}
 	if !s.timerConfig.policyMode.hasTimerMode() {
@@ -104,9 +114,16 @@ func goMemoryPressureCallback(status C.ulong) {
 		return
 	}
 	sample := readMemorySample(policyModeNetworkExtension)
+	critical := C.isCriticalMemoryPressure(status) != 0
 	for _, s := range services {
-		s.logger.Warn("memory pressure: critical, usage: ", byteformats.FormatMemoryBytes(sample.usage))
-		s.writeOOMDraft(sample.usage)
+		if critical {
+			s.logger.Warn("memory pressure: critical, usage: ", byteformats.FormatMemoryBytes(sample.usage))
+			s.writeOOMDraft(sample.usage)
+		} else {
+			// VPN4TV: a warning frees memory and watches the climb as a critical
+			// event does, without the draft.
+			s.logger.Warn("memory pressure: warning, usage: ", byteformats.FormatMemoryBytes(sample.usage))
+		}
 		s.adaptiveTimer.notifyPressure()
 	}
 }

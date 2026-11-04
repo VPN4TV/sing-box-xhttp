@@ -20,6 +20,13 @@ const (
 	defaultSafetyMargin              = 5 * 1024 * 1024
 	defaultAvailableTriggerMarginMin = 32 * 1024 * 1024
 	defaultAvailableTriggerMarginMax = 128 * 1024 * 1024
+
+	// VPN4TV: in the iOS/tvOS Network Extension a trigger holds this long, then
+	// the timer goes back to armed, so a renewed climb past the trigger acts
+	// again. Before, triggered held while usage stayed above resume (30 MiB of
+	// 50, where the extension usually sits), polled every 100 ms and never
+	// acted again.
+	networkExtensionTriggerCooldown = 10 * time.Second
 )
 
 type pressureState uint8
@@ -112,6 +119,8 @@ type adaptiveTimer struct {
 	pendingPressureBaseline bool
 	pressureBaseline        memorySample
 	pressureBaselineTime    time.Time
+	// VPN4TV: when the last trigger acted (networkExtensionTriggerCooldown).
+	triggeredAt time.Time
 }
 
 func newAdaptiveTimer(logger log.ContextLogger, network adapter.NetworkManager, config timerConfig, onTriggered func(uint64)) *adaptiveTimer {
@@ -191,6 +200,9 @@ func (t *adaptiveTimer) poll() {
 			}
 		}
 	}
+	if triggered {
+		t.triggeredAt = time.Now()
+	}
 	t.access.Unlock()
 	if !triggered {
 		return
@@ -218,6 +230,15 @@ func (t *adaptiveTimer) poll() {
 }
 
 func (t *adaptiveTimer) nextState(sample memorySample) pressureState {
+	// VPN4TV: in the Network Extension a trigger cools down instead of holding
+	// down to resume: past the cooldown it is armed (or normal), and a poll that
+	// still finds usage past the trigger acts again.
+	if t.policyMode == policyModeNetworkExtension && t.state == pressureStateTriggered {
+		if time.Since(t.triggeredAt) < networkExtensionTriggerCooldown {
+			return pressureStateTriggered
+		}
+		return nextPressureState(pressureStateNormal, false, sample.usage >= t.limitThresholds.armed, false)
+	}
 	switch t.policyMode {
 	case policyModeMemoryLimit, policyModeNetworkExtension:
 		return nextPressureState(t.state,
@@ -268,10 +289,33 @@ func (t *adaptiveTimer) availableThresholds(sample memorySample) pressureThresho
 }
 
 func (t *adaptiveTimer) intervalForState() time.Duration {
+	if t.policyMode == policyModeNetworkExtension {
+		return t.networkExtensionInterval()
+	}
 	switch {
 	case t.forceMinInterval || t.state == pressureStateTriggered:
 		t.currentInterval = t.minInterval
 	case t.state == pressureStateArmed:
+		t.currentInterval = t.armedInterval
+	default:
+		if t.currentInterval == 0 {
+			t.currentInterval = t.maxInterval
+		} else {
+			t.currentInterval = min(t.currentInterval*2, t.maxInterval)
+		}
+	}
+	return t.currentInterval
+}
+
+// VPN4TV: the Network Extension polls at min_interval (100 ms) only for the
+// first max_interval after a memory pressure event, to catch a fast climb; past
+// that, and while armed or triggered, at the armed interval (1 s), instead of
+// 100 ms for as long as usage stayed above resume.
+func (t *adaptiveTimer) networkExtensionInterval() time.Duration {
+	switch {
+	case t.forceMinInterval && !t.pressureBaselineTime.IsZero() && time.Since(t.pressureBaselineTime) < t.maxInterval:
+		t.currentInterval = t.minInterval
+	case t.forceMinInterval || t.state != pressureStateNormal:
 		t.currentInterval = t.armedInterval
 	default:
 		if t.currentInterval == 0 {
