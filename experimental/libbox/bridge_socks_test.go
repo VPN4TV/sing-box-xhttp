@@ -267,6 +267,29 @@ func TestOutlineBridgeWithoutPasswordIsUnchanged(t *testing.T) {
 	}
 }
 
+// An endpoint without a key (a dynamic key the app could not fetch) gets no
+// listener: outline-sdk would make it a direct dialer past the VPN. The
+// endpoint next to it still starts.
+func TestOutlineBridgeLeavesOutEndpointWithoutKey(t *testing.T) {
+	empty, keyed := freePort(t), freePort(t)
+	config, _ := json.Marshal(outlineConfig{Endpoints: []outlineEndpoint{
+		{Port: empty, Listen: "127.0.0.1"},
+		{URL: "  ", Port: freePort(t), Listen: "127.0.0.1"},
+		{URL: "ss://YWVzLTI1Ni1nY206c2VjcmV0@127.0.0.1:1#t", Port: keyed, Listen: "127.0.0.1"},
+	}})
+	if err := StartOutlineBridge(string(config)); err != nil {
+		t.Fatal(err)
+	}
+	defer StopOutlineBridge()
+	if conn, err := net.Dial("tcp", fmt.Sprintf("127.0.0.1:%d", empty)); err == nil {
+		conn.Close()
+		t.Fatal("the endpoint without a key accepts connections")
+	}
+	if got := probeBridge(t, keyed, "", ""); !bytes.Equal(got, []byte{0x05, 0x00}) {
+		t.Fatalf("keyed endpoint got % x, want 05 00", got)
+	}
+}
+
 func TestWireproxyBridgeRequiresConfiguredPassword(t *testing.T) {
 	port := freePort(t)
 	config, _ := json.Marshal(wireproxyConfig{Endpoints: []wireproxyEndpoint{{

@@ -194,6 +194,17 @@ func StartOutlineBridge(configJSON string) error {
 	// One cap on UDP sessions for the whole bridge.
 	sessions := newBridgeUDPSessions(outlineLog)
 	for i, ep := range cfg.Endpoints {
+		// An endpoint without a key (a dynamic key the app could not fetch) gets
+		// no listener. outline-sdk takes an empty config for no transport at all,
+		// a plain direct dialer, so the endpoint would carry traffic past the VPN
+		// with the real address, and urltest tends to pick it, the direct path
+		// being the fastest. Without a listener sing-box's socks outbound is
+		// refused and urltest marks it dead. Not an error: the other endpoints
+		// and the rest of the profile go on.
+		if strings.TrimSpace(ep.URL) == "" {
+			outlineLog("endpoint %d (port %d): no key, left out", i, ep.Port)
+			continue
+		}
 		resolver := newBridgeResolver(pickBridgeDNS(ep.DNS, cfg.DNS), outlineLog)
 		if resolver != nil {
 			outlineLog("endpoint %d: server names through DNS %s", i, resolver)
