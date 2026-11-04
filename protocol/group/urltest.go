@@ -254,11 +254,34 @@ func NewURLTestGroup(ctx context.Context, outboundManager adapter.OutboundManage
 	}, nil
 }
 
+// VPN4TV: on iOS/tvOS, inside the 50 MiB Network Extension, the first round
+// waits a few seconds after the start, so its probes (and the upstream sessions
+// they leave open) do not pile onto the start itself, and probes fewer servers
+// at a time (urlTestConcurrency). Until a round ends the group uses its first
+// outbound, as before.
+const iosFirstURLTestDelay = 3 * time.Second
+
+func urlTestConcurrency() int {
+	if C.IsIos {
+		return 4
+	}
+	return 10
+}
+
 func (g *URLTestGroup) PostStart() {
 	g.access.Lock()
 	defer g.access.Unlock()
 	g.started = true
 	g.lastActive.Store(time.Now())
+	if C.IsIos {
+		time.AfterFunc(iosFirstURLTestDelay, func() {
+			if g.ctx.Err() != nil {
+				return
+			}
+			g.CheckOutbounds(false)
+		})
+		return
+	}
 	go g.CheckOutbounds(false)
 }
 
@@ -376,7 +399,7 @@ func (g *URLTestGroup) urlTest(ctx context.Context, force bool) (map[string]uint
 		return result, nil
 	}
 	defer g.checking.Store(false)
-	b, _ := batch.New(ctx, batch.WithConcurrencyNum[any](10))
+	b, _ := batch.New(ctx, batch.WithConcurrencyNum[any](urlTestConcurrency()))
 	checked := make(map[string]bool)
 	var resultAccess sync.Mutex
 	for _, detour := range g.outbounds {
