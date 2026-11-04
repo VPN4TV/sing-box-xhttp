@@ -75,10 +75,10 @@ func init() {
 	// surface that triggers store review), so shipping them would be dead weight.
 	sharedTags = append(sharedTags, "with_gvisor", "with_quic", "with_utls", "with_naive_outbound", "with_clash_api", "badlinkname", "tfogo_checklinkname0")
 	// olcRTC (TCP over a WebRTC "call" on a whitelisted meeting service) costs
-	// ~30 MB of pion/livekit; every Apple target and the 64-bit Android
-	// builds carry it, the 32-bit Android build (TV boxes) does not — see
-	// buildAndroid.
-	darwinTags = append(darwinTags, "with_dhcp", "grpcnotrace", "with_olcrtc")
+	// ~30 MB of pion/livekit and no keys are issued for it, so it is left out of
+	// Apple as of every Android ABI (see buildAndroid); the with_olcrtc tag still
+	// brings it back.
+	darwinTags = append(darwinTags, "with_dhcp", "grpcnotrace")
 	// memcTags = append(memcTags, "with_tailscale")
 	// Tailscale dropped: VPN4TV never uses the tailscale endpoint, and it drags
 	// in go-json-experiment (via sagernet/tailscale/ipn) which fails to compile
