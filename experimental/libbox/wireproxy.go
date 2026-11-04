@@ -18,6 +18,7 @@ import (
 	"github.com/amnezia-vpn/amneziawg-go/v3/tun/netstack"
 	wireproxy "github.com/artem-russkikh/wireproxy-awg"
 	"github.com/go-ini/ini"
+	C "github.com/sagernet/sing-box/constant"
 	M "github.com/sagernet/sing/common/metadata"
 )
 
@@ -175,6 +176,13 @@ func startOneAwgEndpoint(ep wireproxyEndpoint, resolver *bridgeResolver, session
 	tunDev, tnet, err := netstack.CreateNetTUN(ipcRequest.DeviceAddr, ipcRequest.DNS, ipcRequest.MTU)
 	if err != nil {
 		return nil, fmt.Errorf("create netTUN: %w", err)
+	}
+	// VPN4TV: smaller TCP buffers inside the 50 MiB Network Extension; see
+	// capAwgNetstackBuffers. Android keeps gVisor's defaults.
+	if C.IsIos {
+		if err := capAwgNetstackBuffers(tnet); err != nil {
+			wireproxyLog("netstack TCP buffers left at the defaults: %v", err)
+		}
 	}
 
 	bind := conn.NewStdNetBind()
