@@ -24,7 +24,7 @@ func TestDecodeDeepLink(t *testing.T) {
 		t.Fatalf("unexpected fields: %+v", link)
 	}
 	toml := link.ClientTOML("127.0.0.1", 46890, "", "")
-	for _, want := range []string{`vpn_mode = "general"`, `killswitch_enabled = true`, `hostname = "bell.a4e.ar"`, `addresses = ["bell.a4e.ar:8443"]`, `username = "vpn4tv-test"`, "[listener.socks]", `address = "127.0.0.1:46890"`} {
+	for _, want := range []string{`vpn_mode = "general"`, `killswitch_enabled = true`, `system_dns_servers = ["127.0.0.1:9"]`, `hostname = "bell.a4e.ar"`, `addresses = ["bell.a4e.ar:8443"]`, `username = "vpn4tv-test"`, "[listener.socks]", `address = "127.0.0.1:46890"`} {
 		if !strings.Contains(toml, want) {
 			t.Errorf("TOML lacks %q:\n%s", want, toml)
 		}

@@ -260,7 +260,13 @@ func (l *DeepLink) ClientTOML(listen string, port int, username, password string
 	// the request is refused and sing-box fails over. In SOCKS mode it changes
 	// nothing else: the firewall rule that blocks untunneled traffic on Windows
 	// belongs to the TUN listener only.
-	b.WriteString("vpn_mode = \"general\"\nkillswitch_enabled = true\n\n[endpoint]\n")
+	//
+	// system_dns_servers (our CLI build, VPN4TV/trusttunnel-client) dead-ends
+	// the client's system DNS proxy, as Android and Apple do: it listens on
+	// loopback with no credentials, and any local process could resolve through
+	// it. The library asks it only while the endpoint is down or for excluded
+	// domains, and we have no exclusions.
+	b.WriteString("vpn_mode = \"general\"\nkillswitch_enabled = true\nsystem_dns_servers = [\"127.0.0.1:9\"]\n\n[endpoint]\n")
 	fmt.Fprintf(&b, "hostname = %s\n", tomlString(l.Hostname))
 	fmt.Fprintf(&b, "addresses = %s\n", tomlStrings(l.Addresses))
 	fmt.Fprintf(&b, "has_ipv6 = %t\n", l.HasIPv6)
