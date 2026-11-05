@@ -23,16 +23,23 @@ func TestDecodeDeepLink(t *testing.T) {
 	if link.Password != "cd7659af3d33b749e220a728" || link.UpstreamProtocol != "http2" || !link.HasIPv6 || link.SkipVerification {
 		t.Fatalf("unexpected fields: %+v", link)
 	}
-	toml := link.ClientTOML("127.0.0.1", 46890)
-	for _, want := range []string{`vpn_mode = "general"`, `killswitch_enabled = false`, `hostname = "bell.a4e.ar"`, `addresses = ["bell.a4e.ar:8443"]`, `username = "vpn4tv-test"`, "[listener.socks]", `address = "127.0.0.1:46890"`} {
+	toml := link.ClientTOML("127.0.0.1", 46890, "", "")
+	for _, want := range []string{`vpn_mode = "general"`, `killswitch_enabled = true`, `hostname = "bell.a4e.ar"`, `addresses = ["bell.a4e.ar:8443"]`, `username = "vpn4tv-test"`, "[listener.socks]", `address = "127.0.0.1:46890"`} {
 		if !strings.Contains(toml, want) {
 			t.Errorf("TOML lacks %q:\n%s", want, toml)
 		}
 	}
+	if strings.Count(toml, "username = ") != 1 {
+		t.Errorf("listener without credentials has a username:\n%s", toml)
+	}
+	// With credentials the listener asks for them.
+	if toml := link.ClientTOML("127.0.0.1", 46890, "u1", `p"2`); !strings.Contains(toml, "[listener.socks]\naddress = \"127.0.0.1:46890\"\nusername = \"u1\"\npassword = \"p\\\"2\"\n") {
+		t.Errorf("listener lacks its credentials:\n%s", toml)
+	}
 	// A link that names DNS upstreams does not get the client's own DNS proxy,
 	// a password-less loopback listener that resolves through the tunnel.
 	link.DNSUpstreams = []string{"8.8.8.8", "tls://1.1.1.1"}
-	if toml := link.ClientTOML("127.0.0.1", 46890); strings.Contains(toml, "dns_upstreams") {
+	if toml := link.ClientTOML("127.0.0.1", 46890, "", ""); strings.Contains(toml, "dns_upstreams") {
 		t.Errorf("TOML has dns_upstreams:\n%s", toml)
 	}
 	// The same link without the '?' is the older spelling.

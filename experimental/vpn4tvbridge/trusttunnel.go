@@ -41,6 +41,10 @@ type TrustTunnelEndpoint struct {
 	URL    string `json:"url"`
 	Port   int    `json:"port"`
 	Listen string `json:"listen,omitempty"`
+	// The SOCKS listener's credentials, as on Android (BridgeAuth): the
+	// loopback is open to every process on the machine. Empty keeps it open.
+	Username string `json:"username,omitempty"`
+	Password string `json:"password,omitempty"`
 }
 
 // TrustTunnelBinary overrides where the CLI is looked for. Empty means next to
@@ -245,13 +249,18 @@ func tomlStrings(values []string) string {
 	return "[" + strings.Join(quoted, ", ") + "]"
 }
 
-// ClientTOML renders the CLI configuration for SOCKS mode on listen:port.
-func (l *DeepLink) ClientTOML(listen string, port int) string {
+// ClientTOML renders the CLI configuration for SOCKS mode on listen:port, with
+// username and password on the listener when they are set.
+func (l *DeepLink) ClientTOML(listen string, port int, username, password string) string {
 	var b strings.Builder
-	// The CLI refuses a config without vpn_mode; the kill switch is a TUN
-	// feature and must stay off, or the SOCKS listener blocks when the
-	// endpoint drops instead of letting sing-box fail over.
-	b.WriteString("vpn_mode = \"general\"\nkillswitch_enabled = false\n\n[endpoint]\n")
+	// The CLI refuses a config without vpn_mode. The kill switch must be on, as
+	// on Android and Apple: while the client recovers a lost or never-made
+	// connection, the listener without it holds a request up to 3 s and then
+	// sends it out directly (VPN_CA_FORCE_BYPASS), around the tunnel. With it
+	// the request is refused and sing-box fails over. In SOCKS mode it changes
+	// nothing else: the firewall rule that blocks untunneled traffic on Windows
+	// belongs to the TUN listener only.
+	b.WriteString("vpn_mode = \"general\"\nkillswitch_enabled = true\n\n[endpoint]\n")
 	fmt.Fprintf(&b, "hostname = %s\n", tomlString(l.Hostname))
 	fmt.Fprintf(&b, "addresses = %s\n", tomlStrings(l.Addresses))
 	fmt.Fprintf(&b, "has_ipv6 = %t\n", l.HasIPv6)
@@ -286,6 +295,9 @@ func (l *DeepLink) ClientTOML(listen string, port int) string {
 	// server's exit address from it. sing-box does the DNS anyway, and a name
 	// in a CONNECT is resolved by the TrustTunnel endpoint.
 	fmt.Fprintf(&b, "\n[listener.socks]\naddress = %s\n", tomlString(fmt.Sprintf("%s:%d", listen, port)))
+	if username != "" {
+		fmt.Fprintf(&b, "username = %s\npassword = %s\n", tomlString(username), tomlString(password))
+	}
 	return b.String()
 }
 
@@ -372,7 +384,7 @@ func StartTrustTunnel(configJSON string) error {
 			listen = "127.0.0.127"
 		}
 		configPath := filepath.Join(workDir, fmt.Sprintf("trusttunnel-%d.toml", index))
-		if err := os.WriteFile(configPath, []byte(link.ClientTOML(listen, endpoint.Port)), 0o600); err != nil {
+		if err := os.WriteFile(configPath, []byte(link.ClientTOML(listen, endpoint.Port, endpoint.Username, endpoint.Password)), 0o600); err != nil {
 			stopTrustTunnelLocked()
 			return fmt.Errorf("trusttunnel: endpoint %d: write config: %w", index, err)
 		}
