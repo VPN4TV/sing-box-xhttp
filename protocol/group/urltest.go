@@ -211,6 +211,9 @@ type URLTestGroup struct {
 	// atomic.Pointer makes the swap a single word operation.
 	selectedTCPRef               atomic.Pointer[outboundRef]
 	selectedUDPRef               atomic.Pointer[outboundRef]
+	// VPN4TV: whether any server of the group has answered yet (selectFirstAnswer).
+	answeredTCP                  atomic.Bool
+	answeredUDP                  atomic.Bool
 	interruptGroup               *interrupt.Group
 	interruptExternalConnections bool
 	access                       sync.Mutex
@@ -380,6 +383,7 @@ func (g *URLTestGroup) urlTest(ctx context.Context, force bool) (map[string]uint
 	checked := make(map[string]bool)
 	var resultAccess sync.Mutex
 	for _, detour := range g.outbounds {
+		member := detour
 		tag := detour.Tag()
 		realTag := RealTag(detour)
 		if checked[realTag] {
@@ -410,6 +414,7 @@ func (g *URLTestGroup) urlTest(ctx context.Context, force bool) (map[string]uint
 				resultAccess.Lock()
 				result[tag] = t
 				resultAccess.Unlock()
+				g.selectFirstAnswer(member)
 			}
 			return nil, nil
 		})
@@ -417,6 +422,26 @@ func (g *URLTestGroup) urlTest(ctx context.Context, force bool) (map[string]uint
 	b.Wait()
 	g.performUpdateCheck()
 	return result, nil
+}
+
+// VPN4TV: until some server of the group has answered (the first round after
+// a start or a reload, or every round until one answers), the first server
+// that answers is picked at once. Before, the group sent everything through
+// its first outbound until the whole round had ended: 6-7 s with 56 servers
+// probed 10 at a time, 18-20 s while a few of them could only time out. The
+// round's end then picks the best as always (performUpdateCheck, within the
+// tolerance): at most one switch, and with interrupt_exist_connections off it
+// moves only new connections. Once a server has answered, nothing changes
+// before a round ends: a later round starts with the previous round's delays,
+// and a switch is decided on the whole round only.
+func (g *URLTestGroup) selectFirstAnswer(member adapter.Outbound) {
+	if common.Contains(member.Network(), N.NetworkTCP) && !g.answeredTCP.Swap(true) {
+		g.storeSelectedTCP(member)
+		g.logger.Debug("first answer: ", member.Tag(), " until the round ends")
+	}
+	if common.Contains(member.Network(), N.NetworkUDP) && !g.answeredUDP.Swap(true) {
+		g.storeSelectedUDP(member)
+	}
 }
 
 func (g *URLTestGroup) performUpdateCheck() {
