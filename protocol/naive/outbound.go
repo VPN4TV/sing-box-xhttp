@@ -186,7 +186,7 @@ func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextL
 	}
 	client, err := cronet.NewNaiveClient(cronet.NaiveClientOptions{
 		Context:                 ctx,
-		Logger:                  logger,
+		Logger:                  probeLogger{logger},
 		ServerAddress:           serverAddress,
 		ServerName:              serverName,
 		Username:                options.Username,
