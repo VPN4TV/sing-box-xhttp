@@ -253,7 +253,7 @@ func (r *Router) routePacketConnection(ctx context.Context, conn N.PacketConn, m
 			}
 			if !common.Contains(selectedOutbound.Network(), N.NetworkUDP) {
 				N.ReleaseMultiPacketBuffer(packetBuffers)
-				return E.New("UDP is not supported by outbound: ", selectedOutbound.Tag())
+				return r.refuseUDP(selectedOutbound)
 			}
 		case *R.RuleActionBypass:
 			if action.Outbound == "" {
@@ -267,7 +267,7 @@ func (r *Router) routePacketConnection(ctx context.Context, conn N.PacketConn, m
 			}
 			if !common.Contains(selectedOutbound.Network(), N.NetworkUDP) {
 				N.ReleaseMultiPacketBuffer(packetBuffers)
-				return E.New("UDP is not supported by outbound: ", selectedOutbound.Tag())
+				return r.refuseUDP(selectedOutbound)
 			}
 		case *R.RuleActionReject:
 			N.ReleaseMultiPacketBuffer(packetBuffers)
@@ -283,7 +283,7 @@ func (r *Router) routePacketConnection(ctx context.Context, conn N.PacketConn, m
 		defaultOutbound := r.outbound.Default()
 		if !common.Contains(defaultOutbound.Network(), N.NetworkUDP) {
 			N.ReleaseMultiPacketBuffer(packetBuffers)
-			return E.New("UDP is not supported by outbound: ", defaultOutbound.Tag())
+			return r.refuseUDP(defaultOutbound)
 		}
 		selectedOutbound = defaultOutbound
 	}
@@ -440,6 +440,14 @@ func (r *Router) preMatchFlow(ctx context.Context, metadata *adapter.InboundCont
 		if !loaded {
 			return continueResult
 		}
+	}
+	// VPN4TV: UDP for a chosen server that carries TCP only is refused here,
+	// with a reply the app sees at once (see refuseUDP). The outbound's own
+	// Network() decides, as in the router: "select" answers for the server it
+	// has chosen, "auto" carries UDP through a member that can.
+	if metadata.Network == N.NetworkUDP && !common.Contains(outbound.Network(), N.NetworkUDP) {
+		_ = r.refuseUDP(outbound)
+		return adapter.PreMatchResult{Action: adapter.PreMatchReject}
 	}
 	for range 8 {
 		group, isGroup := outbound.(adapter.OutboundGroup)
