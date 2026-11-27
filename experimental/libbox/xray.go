@@ -87,6 +87,9 @@ func StartXrayInstance(configJSON string) error {
 	if err != nil {
 		return err
 	}
+	// VPN4TV: its warnings and errors for "Send to support", see xray_problems.go.
+	xrayProblems.clear()
+	xrayProblems.chain(instance)
 	if err := instance.Start(); err != nil {
 		return err
 	}
